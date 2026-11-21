@@ -1,0 +1,12 @@
+MeshCore Companion
+Copyright 2026 Hao Liu
+
+This product includes software developed by Jean-Pierre Martineau as part of MeshTerm
+(https://github.com/jpmartineau/MeshTerm), licensed under the Apache License 2.0:
+meshcore_companion/radionode.py is derived from MeshTerm 0.13.0
+meshterm/core/radionode.py, with modifications (see the file header).
+
+It uses openHop core (https://github.com/openhop-dev/openhop_core, MIT), bundled from the
+fork https://github.com/TheRealHaoLiu/openhop_core (branch feat/ble-transport).
+
+Not affiliated with or endorsed by the MeshCore project, M5Stack, openHop, or MeshTerm.
