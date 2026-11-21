@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if [ "$1" = "purge" ]; then
+    # The node identity and contacts live here; purge means forget them.
+    rm -rf /var/lib/meshcore-companion
+    if getent passwd meshcore >/dev/null; then
+        deluser --system meshcore >/dev/null 2>&1 || true
+    fi
+fi
+exit 0

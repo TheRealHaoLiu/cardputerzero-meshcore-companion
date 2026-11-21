@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=MeshCore
+Comment=MeshCore companion radio for your phone (Cap LoRa-1262)
+Exec=/usr/bin/meshcore-companion
+Icon=share/images/meshcore-companion.png
+Terminal=false
+Type=Application

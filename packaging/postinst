@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    if ! getent passwd meshcore >/dev/null; then
+        adduser --system --group --no-create-home --home /var/lib/meshcore-companion \
+            meshcore >/dev/null
+    fi
+    # Radio (SPI, GPIO, the Cap's I2C expander, the GPS serial port) and BlueZ access by
+    # group membership, not by running as root.
+    for grp in spi gpio i2c dialout bluetooth; do
+        if getent group "$grp" >/dev/null; then
+            adduser meshcore "$grp" >/dev/null 2>&1 || true
+        fi
+    done
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        systemctl enable meshcore-companion.socket meshcore-companion.service >/dev/null 2>&1 || true
+        systemctl restart meshcore-companion.socket || true
+        systemctl restart meshcore-companion.service || true
+    fi
+fi
+exit 0

@@ -1,0 +1,25 @@
+[Unit]
+Description=MeshCore Companion (MeshCore node on the Cap LoRa-1262; Bluetooth and TCP companion)
+Documentation=https://github.com/TheRealHaoLiu/cardputer-zero-meshcore-companion
+Requires=meshcore-companion.socket
+After=meshcore-companion.socket bluetooth.service network.target
+
+[Service]
+Type=simple
+# Radio access (spi, gpio, i2c, dialout) and BlueZ come from group membership (postinst).
+User=meshcore
+Group=meshcore
+StateDirectory=meshcore-companion
+StateDirectoryMode=0750
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/lib/meshcore-companion/meshcore-companiond
+# With "Run in background" off the service exits 0 when idle; the socket starts it again.
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

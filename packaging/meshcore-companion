@@ -1,0 +1,4 @@
+#!/bin/sh
+# MeshCore Companion launcher tile.
+export PYTHONPATH=/usr/lib/meshcore-companion:/usr/lib/meshcore-companion/site
+exec /usr/bin/python3 -s -m meshcore_companion.tile "$@"
