@@ -23,6 +23,10 @@ class ControlError(RuntimeError):
     pass
 
 
+class ConnectionLost(ControlError):
+    """The service went away (it restarted or stopped); connect again."""
+
+
 class Control:
     """A blocking connection to the service. Connecting starts the service (socket activation)."""
 
@@ -42,24 +46,38 @@ class Control:
                 line, self._buf = self._buf.split(b"\n", 1)
                 if line.strip():
                     yield json.loads(line)
-            chunk = self.sock.recv(4096)
+            try:
+                chunk = self.sock.recv(4096)
+            except (socket.timeout, BlockingIOError):
+                raise
+            except OSError as exc:
+                raise ConnectionLost(f"service connection lost: {exc}") from None
             if not chunk:
-                raise ControlError("service closed the connection")
+                raise ConnectionLost("service closed the connection")
             self._buf += chunk
 
     def request(self, cmd: str, **kw: Any) -> Dict[str, Any]:
-        self.sock.sendall((json.dumps({"cmd": cmd, **kw}) + "\n").encode())
-        for msg in self._lines():
-            if "event" in msg:
-                self.events.append(msg)
-                continue
-            if not msg.get("ok"):
-                raise ControlError(msg.get("error", "failed"))
-            return msg
+        try:
+            self.sock.sendall((json.dumps({"cmd": cmd, **kw}) + "\n").encode())
+            for msg in self._lines():
+                if "event" in msg:
+                    self.events.append(msg)
+                    continue
+                if not msg.get("ok"):
+                    raise ControlError(msg.get("error", "failed"))
+                return msg
+        except socket.timeout:
+            raise ConnectionLost("service did not answer") from None
+        except OSError as exc:  # the send failed
+            raise ConnectionLost(f"service connection lost: {exc}") from None
         raise ControlError("no reply")
 
     def poll_event(self, timeout: float = 0.0) -> Optional[Dict[str, Any]]:
-        """Return one pushed event (after ``subscribe``), or None if none arrives in time."""
+        """Return one pushed event (after ``subscribe``), or None if none arrives in time.
+
+        Raises:
+            ConnectionLost: the service closed the connection (it restarted or stopped).
+        """
         if self.events:
             return self.events.pop(0)
         old = self.sock.gettimeout()

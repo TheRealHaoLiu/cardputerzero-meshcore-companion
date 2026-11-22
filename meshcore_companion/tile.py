@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .control import Control, ControlError
+from .control import ConnectionLost, Control, ControlError
 from .config import CONTROL_SOCKET
 
 W, H = 320, 170
@@ -32,6 +32,9 @@ FBIOBLANK = 0x4611
 
 ESC, ENTER, KPENTER, UP, DOWN, KEY_F, KEY_X = 1, 28, 96, 103, 108, 33, 45
 EXIT_HOLD = 1.0
+STATUS_EVERY_S = 2.0  # how often the tile asks for the status (it redraws only on a change)
+RECONNECT_EVERY_S = 2.0  # after the service went away (it restarted): try again this often
+RECONNECT_TIMEOUT_S = 5.0
 EVENT = struct.Struct("llHHi")
 EV_KEY = 1
 
@@ -123,8 +126,11 @@ class Row:
 
 
 class App:
-    def __init__(self, control: Control, screen: Screen, keys: Keys) -> None:
-        self.c, self.screen, self.keys = control, screen, keys
+    def __init__(self, control: Optional[Control], screen: Screen, keys: Keys,
+                 path: str = str(CONTROL_SOCKET)) -> None:
+        self.c, self.screen, self.keys, self.path = control, screen, keys, path
+        self._reconnect_at = 0.0
+        self._footer_message = False  # the frame on screen shows a timed message
         self.status: Dict[str, Any] = {}
         self.page = "main"
         self.sel = 0
@@ -140,14 +146,45 @@ class App:
     # -- service calls ---------------------------------------------------------
 
     def call(self, cmd: str, **kw: Any) -> Dict[str, Any]:
+        if self.c is None:
+            return {}
         try:
             reply = self.c.request(cmd, **kw)
+        except ConnectionLost:
+            self.lost()
+            return {}
         except (ControlError, OSError) as exc:
             self.say(f"Error: {exc}", 4)
             return {}
         if "status" in reply:
             self.status = reply["status"]
         return reply
+
+    def lost(self) -> None:
+        """The service went away (a restart, or it stopped): show it and connect again."""
+        if self.c is not None:
+            try:
+                self.c.close()
+            except OSError:
+                pass
+        self.c = None
+        self.status = {}
+        self.passkey = None
+        self._reconnect_at = time.monotonic() + RECONNECT_EVERY_S
+
+    def reconnect(self) -> bool:
+        """One attempt to connect again (it also starts the service: socket activation)."""
+        self._reconnect_at = time.monotonic() + RECONNECT_EVERY_S
+        try:
+            self.c = Control(self.path, timeout=RECONNECT_TIMEOUT_S)
+        except OSError:
+            return False
+        if not self.call("subscribe") or self.c is None:
+            return False
+        self.c.sock.settimeout(30.0)
+        if self.page == "pair_window":  # the window closed with the old service
+            self.goto("pairing")
+        return True
 
     def toggle(self, key: str) -> None:
         value = not self.status.get("settings", {}).get(key)
@@ -244,7 +281,9 @@ class App:
         img = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(img)
         st = self.status
-        if st.get("error") and not st.get("running"):
+        if self.c is None:
+            state, color = "Restarting", ACCENT
+        elif st.get("error") and not st.get("running"):
             state, color = "Error", WARN
         elif st.get("running"):
             state, color = "Running", GOOD
@@ -264,7 +303,9 @@ class App:
                 bits.append(f"{st['contacts']} contacts")
             bits.append(st.get("client") or "no app connected")
             line, line_color = " · ".join(bits), DIM
-            if st.get("error"):
+            if self.c is None:
+                line, line_color = "Service restarting…", ACCENT
+            elif st.get("error"):
                 line, line_color = st["error"][:48], WARN
             d.text((8, 27), line, font=self.f_small, fill=line_color)
 
@@ -291,9 +332,9 @@ class App:
             d.text((W // 2, 70), self.confirm[0], font=self.f, fill=FG, anchor="mm")
             d.text((W // 2, 100), "ENTER yes · ESC no", font=self.f_small, fill=DIM, anchor="mm")
 
-        foot = self.message if time.monotonic() < self.message_until else (
-            "F/X move · ENTER select · ESC back")
-        d.text((8, H - 16), foot, font=self.f_small, fill=ACCENT if self.message else DIM)
+        self._footer_message = time.monotonic() < self.message_until
+        foot = self.message if self._footer_message else "F/X move · ENTER select · ESC back"
+        d.text((8, H - 16), foot, font=self.f_small, fill=ACCENT if self._footer_message else DIM)
         self.screen.show(img)
 
     def draw_pair_window(self, d: ImageDraw.ImageDraw) -> None:
@@ -342,7 +383,8 @@ class App:
             self.say("Pairing finished", 4)
 
     def run(self) -> None:
-        self.call("subscribe")
+        if self.c is not None:
+            self.call("subscribe")
         esc_down: Optional[float] = None
         last_poll = 0.0
         self.draw()
@@ -362,15 +404,30 @@ class App:
                     changed = True
             if esc_down is not None and time.monotonic() - esc_down >= EXIT_HOLD:
                 break
-            while True:
-                ev = self.c.poll_event(0)
+            if self.c is None:
+                if time.monotonic() >= self._reconnect_at:
+                    changed |= self.reconnect()
+                    last_poll = time.monotonic()
+            while self.c is not None:
+                try:
+                    ev = self.c.poll_event(0)
+                except ControlError:  # ConnectionLost, or a garbled line
+                    self.lost()
+                    changed = True
+                    break
                 if ev is None:
                     break
                 self.on_event(ev)
                 changed = True
-            if time.monotonic() - last_poll > 2:
+            if self.c is not None and time.monotonic() - last_poll > STATUS_EVERY_S:
+                # A full frame (PIL render, RGB565, framebuffer write) only when what it
+                # shows changed: the status (a countdown changes it each poll), the
+                # connection, or a timed message running out.
+                before = self.status
                 self.call("status")
                 last_poll = time.monotonic()
+                changed |= self.status != before or self.c is None
+            if self._footer_message and time.monotonic() >= self.message_until:
                 changed = True
             if changed:
                 self.draw()
@@ -390,10 +447,12 @@ def main() -> int:
         screen.show(img)
         time.sleep(4)
         return 1
+    app = App(control, screen, keys, path)
     try:
-        App(control, screen, keys).run()
+        app.run()
     finally:
-        control.close()
+        if app.c is not None:
+            app.c.close()
     return 0
 
 
