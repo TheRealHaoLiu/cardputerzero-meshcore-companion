@@ -1,10 +1,19 @@
 #!/bin/sh
 set -e
+UNITS="meshcore-companion.socket meshcore-companion.service"
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
+if [ "$1" = "remove" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper mask $UNITS >/dev/null || true
+fi
 if [ "$1" = "purge" ]; then
-    # The node identity and contacts live here; purge means forget them.
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper purge $UNITS >/dev/null || true
+        deb-systemd-helper unmask $UNITS >/dev/null || true
+    fi
+    # The node identity (identity.key: the node's address on the mesh), its contacts,
+    # channels and settings, and the list of paired phones live here; purge forgets them.
     rm -rf /var/lib/meshcore-companion
     if getent passwd meshcore >/dev/null; then
         deluser --system meshcore >/dev/null 2>&1 || true

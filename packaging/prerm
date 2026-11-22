@@ -1,9 +1,18 @@
 #!/bin/sh
 set -e
+MARK=/run/meshcore-companion.upgrade-restart  # postinst starts the service again if set
 if [ -d /run/systemd/system ]; then
+    if [ "$1" = "upgrade" ] && systemctl is-active --quiet meshcore-companion.service; then
+        touch "$MARK" || true
+    fi
     systemctl stop meshcore-companion.service meshcore-companion.socket >/dev/null 2>&1 || true
-    if [ "$1" = "remove" ]; then
+    if [ "$1" = "remove" ] && ! command -v deb-systemd-helper >/dev/null 2>&1; then
         systemctl disable meshcore-companion.service meshcore-companion.socket >/dev/null 2>&1 || true
     fi
+fi
+# The bytecode postinst compiled is not in the package: remove it, or dpkg cannot remove
+# the directories (and an upgrade would keep stale .pyc files).
+if [ -d /usr/lib/meshcore-companion ]; then
+    find /usr/lib/meshcore-companion -depth -type d -name __pycache__ -exec rm -rf {} + || true
 fi
 exit 0
