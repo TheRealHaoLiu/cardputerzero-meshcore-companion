@@ -178,16 +178,25 @@ class App:
                 Row("Method", lambda: "Code" if s.get("pairing") == "code" else "Button",
                     lambda: self.call("set", key="pairing",
                                       value="button" if s.get("pairing") == "code" else "code")),
-                Row("Paired phones", lambda: str(len(self.devices)), lambda: self.goto("paired")),
+                Row("Paired phones", lambda: str(len(self.ours())), lambda: self.goto("paired")),
                 Row("Forget all", lambda: "", lambda: self.ask(
-                    "Forget all paired phones?", lambda: self.forget("all"))),
+                    "Forget phones paired here?", lambda: self.forget("all"))),
             ]
         if self.page == "paired":
+            # Only devices that paired in this app's pairing window can be forgotten here;
+            # the rest (a keyboard, a headset, a phone paired before the app kept a list)
+            # are shown so nothing is hidden, but left alone.
             return [Row(d["name"] + (" ●" if d.get("connected") else ""), lambda: "",
                         (lambda d=d: self.ask(f"Forget {d['name']}?",
                                               lambda: self.forget(d["device"]))))
-                    for d in self.devices] or [Row("No paired phones")]
+                    for d in self.ours()] + [
+                Row(d["name"], lambda: "other",
+                    lambda: self.say("Paired elsewhere: not removed here", 4))
+                for d in self.devices if not d.get("managed")] or [Row("No paired phones")]
         return []
+
+    def ours(self) -> List[Dict[str, Any]]:
+        return [d for d in self.devices if d.get("managed")]
 
     def goto(self, page: str) -> None:
         self.page, self.sel = page, 0

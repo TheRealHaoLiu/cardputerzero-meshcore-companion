@@ -13,6 +13,7 @@ tile connects to the control socket (socket activation).
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -29,6 +30,8 @@ log = logging.getLogger("meshcore-companion")
 
 IDLE_EXIT_S = 20  # background off: exit after this long without a tile connected
 PAIR_WINDOW_S = 120
+PAIR_WINDOW_MAX_S = 300  # the longest pairing window the control socket may ask for
+PAIR_GRACE_S = 30  # a pairing that started in the window may finish this much later
 _ADAPTER = "/org/bluez/hci0"
 
 
@@ -45,6 +48,14 @@ class Service:
         self.ble: Any = None
         self.node_error: Optional[str] = None
         self.pair_until = 0.0
+        self._pair_timer: Optional[asyncio.TimerHandle] = None
+        # Bluetooth devices that paired while this service's pairing window was open: the
+        # only ones it lists as its own and forgets. Others on the adapter (keyboards,
+        # headsets, phones paired before this list existed) are left alone.
+        self.managed_path = state_dir / "bluetooth.json"
+        saved = statefile.read_json(self.managed_path, dict) or {}
+        self.managed: Set[str] = {str(a) for a in saved.get("managed", []) if isinstance(a, str)}
+        self._pair_baseline: Optional[Set[str]] = None  # addresses paired when the window opened
         self._bus: Any = None
         self._last_client = time.monotonic()
         self.stopping = asyncio.Event()
@@ -135,6 +146,7 @@ class Service:
     def _on_passkey(self, device: str, passkey: Optional[int]) -> None:
         if passkey is None:
             self.broadcast({"event": "pairing_done"})
+            asyncio.ensure_future(self._note_new_pairings())
         elif time.monotonic() < self.pair_until:
             self.broadcast({"event": "passkey", "passkey": f"{passkey:06d}", "device": device})
 
@@ -170,39 +182,106 @@ class Service:
         except Exception as exc:  # noqa: BLE001
             log.warning("could not set pairable: %s", exc)
 
+    def _arm_pair_timer(self, delay: float, callback) -> None:
+        if self._pair_timer is not None:
+            self._pair_timer.cancel()
+        self._pair_timer = asyncio.get_running_loop().call_later(
+            delay, lambda: asyncio.ensure_future(callback()))
+
     async def open_pairing(self, seconds: int = PAIR_WINDOW_S) -> None:
+        seconds = min(max(int(seconds), 1), PAIR_WINDOW_MAX_S)
+        if self._pair_baseline is None:
+            try:
+                self._pair_baseline = set(await self._paired())
+            except Exception as exc:  # noqa: BLE001 - pairing still works; it is just not recorded
+                log.warning("could not list paired devices: %s", exc)
         self.pair_until = time.monotonic() + seconds
         await self._apply_pairable()
-        asyncio.get_running_loop().call_later(
-            seconds + 1, lambda: asyncio.ensure_future(self._apply_pairable())
-        )
+        self._arm_pair_timer(seconds + 1, self._window_closed)
 
     async def close_pairing(self) -> None:
         self.pair_until = 0.0
-        await self._apply_pairable()
+        await self._window_closed()
 
-    async def paired_devices(self) -> List[Dict[str, Any]]:
+    async def _window_closed(self) -> None:
+        if time.monotonic() < self.pair_until:
+            return  # reopened in the meantime
+        await self._apply_pairable()
+        await self._note_new_pairings()
+        self._arm_pair_timer(PAIR_GRACE_S, self._end_pair_tracking)
+
+    async def _end_pair_tracking(self) -> None:
+        await self._note_new_pairings()
+        if time.monotonic() >= self.pair_until:
+            self._pair_baseline = None
+
+    async def _note_new_pairings(self, paired: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        """Record the devices that became paired since the pairing window opened."""
+        if self._pair_baseline is None:
+            return
+        try:
+            paired = paired if paired is not None else await self._paired()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not list paired devices: %s", exc)
+            return
+        new = set(paired) - self._pair_baseline - self.managed
+        if new:
+            self.managed |= new
+            self._save_managed()
+            log.info("recorded %d device(s) paired through the pairing window", len(new))
+
+    def _save_managed(self) -> None:
+        try:
+            statefile.write_atomic(self.managed_path,
+                                   statefile.dumps({"managed": sorted(self.managed)}), fsync=True)
+        except OSError as exc:
+            log.warning("could not save %s: %s", self.managed_path.name, exc)
+
+    async def _paired(self) -> Dict[str, Dict[str, Any]]:
+        """Every paired device on the adapter, by Bluetooth address."""
         objects = (await self._bluez("/", "org.freedesktop.DBus.ObjectManager",
                                      "GetManagedObjects"))[0]
-        out = []
+        out = {}
         for path, ifaces in objects.items():
             dev = ifaces.get("org.bluez.Device1")
             if not path.startswith(_ADAPTER + "/") or not dev:
                 continue
             if not getattr(dev.get("Paired"), "value", False):
                 continue
-            out.append({
+            address = str(getattr(dev.get("Address"), "value", "") or path)
+            out[address] = {
                 "device": path,
                 "name": getattr(dev.get("Alias") or dev.get("Name"), "value", "?"),
                 "connected": bool(getattr(dev.get("Connected"), "value", False)),
-            })
+            }
         return out
 
+    async def paired_devices(self) -> List[Dict[str, Any]]:
+        """The paired devices, ours first; ``managed`` is False for the ones paired elsewhere."""
+        paired = await self._paired()
+        await self._note_new_pairings(paired)
+        out = [dict(info, managed=address in self.managed) for address, info in paired.items()]
+        return sorted(out, key=lambda d: (not d["managed"], str(d["name"])))
+
     async def forget(self, device: str) -> int:
-        targets = [d["device"] for d in await self.paired_devices()
-                   if device in ("all", d["device"])]
-        for path in targets:
-            await self._bluez(_ADAPTER, "org.bluez.Adapter1", "RemoveDevice", "o", [path])
+        """Unpair one of our devices (by D-Bus path) or ``all`` of them; never another device."""
+        paired = await self._paired()
+        if device == "all":
+            targets = [a for a in paired if a in self.managed]
+        else:
+            targets = [a for a, info in paired.items() if info["device"] == device]
+            if not targets:
+                raise ValueError("no such paired device")
+            if targets[0] not in self.managed:
+                raise ValueError("not paired through this app; not forgotten")
+        for address in targets:
+            await self._bluez(_ADAPTER, "org.bluez.Adapter1", "RemoveDevice", "o",
+                              [paired[address]["device"]])
+        before = set(self.managed)
+        self.managed -= set(targets)
+        self.managed &= set(paired)  # also drop ours that were unpaired some other way
+        if self.managed != before:
+            self._save_managed()
         return len(targets)
 
     # ------------------------------------------------------------------
@@ -213,12 +292,13 @@ class Service:
         node, server = self.node, self.server
         client = None
         writer = getattr(server, "_client_writer", None)
-        if writer is not None:
-            peer = writer.get_extra_info("peername") if hasattr(writer, "get_extra_info") else None
-            if self.ble is not None and self.ble.connected:
-                client = "Bluetooth"
-            elif peer:
-                client = "this device" if str(peer[0]).startswith("127.") else f"Wi-Fi {peer[0]}"
+        path = client_path(writer, self.ble)
+        if path == "bluetooth":
+            client = "Bluetooth"
+        elif path == "loopback":
+            client = "this device"
+        elif path == "network":
+            client = f"Wi-Fi {(writer.get_extra_info('peername') or ('?',))[0]}"
         name = getattr(getattr(node, "prefs", None), "node_name", None)
         contacts = node.contacts.get_count() if node is not None else None
         return {
@@ -272,8 +352,8 @@ class Service:
                     reply = {"ok": False, "error": str(exc)}
                 writer.write((json.dumps(reply) + "\n").encode())
                 await writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError):
-            pass
+        except (ConnectionError, asyncio.IncompleteReadError, ValueError):
+            pass  # ValueError: a line longer than the stream limit
         finally:
             self.clients.discard(writer)
             self.subscribers.discard(writer)
@@ -282,17 +362,25 @@ class Service:
 
     async def handle_request(self, req: Dict[str, Any],
                              writer: asyncio.StreamWriter) -> Dict[str, Any]:
+        if not isinstance(req, dict):
+            raise ValueError("a request is a JSON object")
         cmd = req.get("cmd")
         if cmd == "status":
             return {"ok": True, "status": self.status()}
         if cmd == "set":
-            await self.set(req["key"], req["value"])
+            key, value = req.get("key"), req.get("value")
+            if not isinstance(key, str):
+                raise ValueError("set needs a key")
+            await self.set(key, value)
             return {"ok": True, "status": self.status()}
         if cmd == "subscribe":
             self.subscribers.add(writer)
             return {"ok": True, "status": self.status()}
         if cmd == "pair":
-            await self.open_pairing(int(req.get("seconds", PAIR_WINDOW_S)))
+            seconds = req.get("seconds", PAIR_WINDOW_S)
+            if isinstance(seconds, bool) or not isinstance(seconds, int):
+                raise ValueError("seconds must be a whole number")
+            await self.open_pairing(seconds)  # clamped to 1..PAIR_WINDOW_MAX_S
             return {"ok": True, "status": self.status()}
         if cmd == "pair_stop":
             await self.close_pairing()
@@ -300,7 +388,10 @@ class Service:
         if cmd == "paired":
             return {"ok": True, "devices": await self.paired_devices()}
         if cmd == "forget":
-            return {"ok": True, "forgotten": await self.forget(str(req.get("device", "")))}
+            device = req.get("device")
+            if not isinstance(device, str) or not device:
+                raise ValueError("forget needs a device path or all")
+            return {"ok": True, "forgotten": await self.forget(device)}
         raise ValueError(f"unknown command {cmd!r}")
 
     async def serve(self, sock: socket.socket) -> None:
@@ -325,23 +416,74 @@ class Service:
             self._bus.disconnect()
 
 
+def client_path(writer: Any, ble: Any) -> Optional[str]:
+    """How the frame server's current client reaches it: ``bluetooth``, ``loopback`` (TCP
+    from this device), ``network`` (TCP from anywhere else), or None with no client.
+
+    A Bluetooth session is recognised positively, as the writer of the BLE transport's
+    current session, not as "a writer without a peer address".
+    """
+    if writer is None:
+        return None
+    session = getattr(ble, "_session", None)
+    if session is not None and writer is getattr(session, "writer", None):
+        return "bluetooth"
+    peer = writer.get_extra_info("peername") if hasattr(writer, "get_extra_info") else None
+    if isinstance(peer, (tuple, list)) and peer:
+        try:
+            address = ipaddress.ip_address(str(peer[0]).split("%", 1)[0])
+        except ValueError:
+            return "network"
+        mapped = getattr(address, "ipv4_mapped", None)
+        if address.is_loopback or (mapped is not None and mapped.is_loopback):
+            return "loopback"
+    return "network"
+
+
+#: The client paths that may read or replace the node's private key: this device itself,
+#: and a phone over Bluetooth (bonded, and with "code" pairing MITM-protected). Never Wi-Fi,
+#: which has no authentication at all.
+KEY_ACCESS_PATHS = ("loopback", "bluetooth")
+
+
 def _frame_server_class(service: Service):
-    """``CompanionFrameServer`` with private-key import enabled (openHop ships it disabled).
+    """``CompanionFrameServer`` with private-key import enabled (openHop ships it disabled),
+    and private-key export and import refused to clients on the network.
 
     The MeshCore app's "Import private key" sends the 64-byte firmware-format key; it is
     checked, saved as the node's identity (mode 0600, fsynced before it replaces the old
-    one), and the node restarts with it.
+    one), and the node restarts with it. Both key commands answer ``RESP_CODE_DISABLED``
+    (what firmware built without key export/import answers) unless the client is on
+    loopback TCP or Bluetooth (:data:`KEY_ACCESS_PATHS`).
     """
     from openhop_core.companion import CompanionFrameServer
-    from openhop_core.companion.constants import ERR_CODE_ILLEGAL_ARG, ERR_CODE_UNSUPPORTED_CMD
+    from openhop_core.companion.constants import (
+        ERR_CODE_ILLEGAL_ARG,
+        ERR_CODE_UNSUPPORTED_CMD,
+        RESP_CODE_DISABLED,
+    )
     from openhop_core.protocol.identity import LocalIdentity
 
     from . import radionode
 
     class Server(CompanionFrameServer):
+        def _key_access(self, what: str) -> bool:
+            path = client_path(self._client_writer, service.ble)
+            if path in KEY_ACCESS_PATHS:
+                return True
+            log.warning("refused private key %s to a %s client", what, path or "missing")
+            self._write_frame(bytes([RESP_CODE_DISABLED]))
+            return False
+
+        async def _cmd_export_private_key(self, data: bytes) -> None:
+            if self._key_access("export"):
+                await super()._cmd_export_private_key(data)
+
         async def _cmd_import_private_key(self, data: bytes) -> None:
             if len(data) < 64:
                 self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+                return
+            if not self._key_access("import"):
                 return
             key = bytes(data[:64])
             try:
@@ -401,7 +543,7 @@ def control_socket() -> socket.socket:
         pass
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(path))
-    os.chmod(path, 0o666)
+    os.chmod(path, 0o660)  # as the socket unit sets it (there with group input)
     sock.listen(8)
     return sock
 
