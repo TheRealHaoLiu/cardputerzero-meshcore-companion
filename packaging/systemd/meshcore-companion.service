@@ -1,6 +1,6 @@
 [Unit]
 Description=MeshCore Companion (MeshCore node on the Cap LoRa-1262; Bluetooth and TCP companion)
-Documentation=https://github.com/TheRealHaoLiu/cardputer-zero-meshcore-companion
+Documentation=https://github.com/TheRealHaoLiu/cardputerzero-meshcore-companion
 Requires=meshcore-companion.socket
 After=meshcore-companion.socket bluetooth.service network.target
 

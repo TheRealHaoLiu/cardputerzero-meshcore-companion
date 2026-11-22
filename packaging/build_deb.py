@@ -127,7 +127,7 @@ def build(openhop: Path, out: Path, wheels: Path = None) -> Path:
             f"Package: {PKG}\nVersion: {__version__}-1\nArchitecture: arm64\n"
             f"Maintainer: Hao Liu <noreply@github.com>\nInstalled-Size: {size_kb}\n"
             f"Depends: {DEPENDS}\nSection: comm\nPriority: optional\n"
-            "Homepage: https://github.com/TheRealHaoLiu/cardputer-zero-meshcore-companion\n"
+            "Homepage: https://github.com/TheRealHaoLiu/cardputerzero-meshcore-companion\n"
             "Description: MeshCore companion radio for the CardputerZero (Cap LoRa-1262)\n"
             " Runs a MeshCore node on the Cap LoRa-1262 in the background and serves the\n"
             " companion protocol over Bluetooth LE (for the MeshCore phone apps), TCP on\n"
