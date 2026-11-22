@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from . import config as cfg
+from . import statefile
 
 log = logging.getLogger("meshcore-companion")
 
@@ -328,11 +329,14 @@ def _frame_server_class(service: Service):
     """``CompanionFrameServer`` with private-key import enabled (openHop ships it disabled).
 
     The MeshCore app's "Import private key" sends the 64-byte firmware-format key; it is
-    checked, saved as the node's identity, and the node restarts with it.
+    checked, saved as the node's identity (mode 0600, fsynced before it replaces the old
+    one), and the node restarts with it.
     """
     from openhop_core.companion import CompanionFrameServer
     from openhop_core.companion.constants import ERR_CODE_ILLEGAL_ARG, ERR_CODE_UNSUPPORTED_CMD
     from openhop_core.protocol.identity import LocalIdentity
+
+    from . import radionode
 
     class Server(CompanionFrameServer):
         async def _cmd_import_private_key(self, data: bytes) -> None:
@@ -345,11 +349,7 @@ def _frame_server_class(service: Service):
             except Exception:  # noqa: BLE001
                 self._write_err(ERR_CODE_ILLEGAL_ARG)
                 return
-            path = service.state_dir / "node" / "identity.key"
-            tmp = path.with_name(f"identity.key.{os.getpid()}.tmp")
-            tmp.write_bytes(key)
-            os.chmod(tmp, 0o600)
-            tmp.replace(path)
+            radionode.save_identity_key(service.state_dir / "node" / "identity.key", key)
             log.info("imported a new node identity; restarting the node")
             self._write_ok()
             asyncio.get_running_loop().call_later(
@@ -367,6 +367,7 @@ _ERRORS = {
     "busy": "Radio in use by another app",
     "permission": "No permission for the radio",
     "runtime": "Radio library missing",
+    "identity": "Node identity unreadable; kept, see journal",
 }
 
 
@@ -417,6 +418,7 @@ def main() -> int:
             logging.getLogger(name).setLevel(logging.INFO)
         logging.getLogger("SX1262_wrapper").setLevel(logging.ERROR)
     cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    statefile.remove_stale_tmp(cfg.STATE_DIR)  # the node directory is swept when the node starts
     service = Service()
     asyncio.run(service.serve(control_socket()))
     return 0

@@ -1,9 +1,10 @@
 """Settings of the service, and the Cap LoRa-1262 wiring."""
 
-import json
 import os
 from pathlib import Path
 from typing import Any, Dict
+
+from . import statefile
 
 STATE_DIR = Path(os.environ.get("MESHCORE_COMPANION_STATE", "/var/lib/meshcore-companion"))
 RUNTIME_DIR = Path(os.environ.get("MESHCORE_COMPANION_RUNTIME", "/run/meshcore-companion"))
@@ -56,13 +57,14 @@ SEED = {
 
 
 def load(path: Path = None) -> Dict[str, Any]:
-    """The saved settings over the defaults; unknown keys and bad types are ignored."""
+    """The saved settings over the defaults; unknown keys and bad types are ignored.
+
+    A file that does not parse is moved to ``config.json.bad`` (one warning) and the
+    defaults apply.
+    """
     path = path or STATE_DIR / "config.json"
     out = dict(DEFAULTS)
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return out
+    saved = statefile.read_json(path, dict)
     if isinstance(saved, dict):
         for key, default in DEFAULTS.items():
             if key in saved and isinstance(saved[key], type(default)):
@@ -73,8 +75,7 @@ def load(path: Path = None) -> Dict[str, Any]:
 
 
 def save(settings: Dict[str, Any], path: Path = None) -> None:
-    """Write the settings in one rename, so a crash leaves the old file."""
+    """Write the settings in one rename and fsync them: a switch the user set must survive
+    a power loss (the file changes only when the user changes a setting)."""
     path = path or STATE_DIR / "config.json"
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({k: settings[k] for k in DEFAULTS}, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    statefile.write_atomic(path, statefile.dumps({k: settings[k] for k in DEFAULTS}), fsync=True)

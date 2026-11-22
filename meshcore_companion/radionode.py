@@ -80,6 +80,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .statefile import digest, dumps, read_json, remove_stale_tmp, set_aside, write_atomic
+
 #: The radio library that this node runs on. This file does not support ``pymc_core``
 #: (the name of the library before 2026). It needs three shims that ``openhop_core`` made
 #: unnecessary, and the standalone bridge still has them for the users of the old library.
@@ -149,23 +151,23 @@ def classify_begin_failure(lines: list[str]) -> str:
 # --- the state directory -------------------------------------------------------------------
 
 
-def _write_json(path: Path, value: Any) -> None:
-    """Replace ``path`` with ``value`` as JSON in one rename (after a crash, the old file stays)."""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    tmp.replace(path)
+#: The key lengths that ``LocalIdentity`` accepts: a 32-byte Ed25519 seed (what the
+#: library mints) or the 64-byte expanded key of MeshCore firmware (what the app imports).
+IDENTITY_KEY_LENGTHS = (32, 64)  # MeshCore Companion
 
 
-def _read_json(path: Path) -> Any:
-    """``path`` parsed as JSON, or ``None`` when it is missing or cannot be read."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+def save_identity_key(path: Path, key: bytes) -> None:  # MeshCore Companion
+    """Write ``identity.key``: mode 0600 from creation, on the card before and after the rename."""
+    write_atomic(path, bytes(key), mode=0o600, fsync=True)
 
 
 def load_identity_seed(state: Path, mint) -> bytes:  # noqa: ANN001 - () -> bytes
     """The private seed of the node from ``identity.key``, or a new one that it mints and saves.
+
+    MeshCore Companion: a new identity is minted only when the file does not exist. A file
+    that cannot be read, is empty, or has a length the library does not accept stops the
+    node with a ``NodeError`` of kind ``identity``, and the file is never replaced: it is
+    the identity of the node on the mesh, and contacts know the node by it.
 
     Args:
         state: The state directory of the node.
@@ -175,18 +177,19 @@ def load_identity_seed(state: Path, mint) -> bytes:  # noqa: ANN001 - () -> byte
     path = state / "identity.key"
     try:
         seed = path.read_bytes()
-    except OSError:
-        seed = b""
-    if seed:
+    except FileNotFoundError:
+        seed = None
+    except OSError as exc:
+        raise NodeError("identity", f"cannot read {path} ({exc}); it was left as it is") from None
+    if seed is not None:
+        if len(seed) not in IDENTITY_KEY_LENGTHS:
+            raise NodeError(
+                "identity",
+                f"{path} holds {len(seed)} bytes, not a 32- or 64-byte key; it was left as it is",
+            )
         return seed
     seed = bytes(mint())
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_bytes(seed)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+    save_identity_key(path, seed)
     log.info("minted a new node identity at %s", path)
     return seed
 
@@ -644,15 +647,98 @@ class Gps:
         self._next_at = now + max(self.interval_s, 1)
 
 
-def _persist_contacts(store: Any, path: Path) -> None:
-    """Write a snapshot of the contact list after each change, as the firmware writes flash."""
+#: MeshCore Companion: the longest time a change that the mesh made (an advert, a path, a
+#: room sync watermark) waits before ``contacts.json`` is written. On a busy mesh the
+#: library changes a contact every few seconds; this bounds the writes to the SD card.
+CONTACTS_FLUSH_S = 300.0
 
-    def save() -> None:
+#: MeshCore Companion: how soon a change that the user made in the app (a contact added,
+#: removed, imported or its path reset, a channel set) is written, so that an explicit
+#: action survives a power loss.
+USER_FLUSH_S = 3.0
+
+
+class DeferredSave:  # MeshCore Companion
+    """One state file, written at most once per ``interval`` and only when its content changed.
+
+    A change only marks the file dirty and arms one timer. When the timer fires, the
+    value is taken on the event loop (``snapshot`` returns plain data that no one else
+    holds), then serialised, compared with what was last written, and written in a
+    worker thread, so a large contact list never stalls the radio. :meth:`close` writes
+    what is left at shutdown. A failed write leaves the file dirty for the next attempt.
+    """
+
+    def __init__(self, path: Path, snapshot, interval: float) -> None:  # noqa: ANN001
+        self.path = path
+        self.snapshot = snapshot
+        self.interval = interval
+        self.writes = 0
+        self._digest: bytes | None = None
+        self._dirty = False
+        self._timer: asyncio.TimerHandle | None = None
+        self._task: asyncio.Future | None = None  # the timed flush, kept referenced
+        self._lock = asyncio.Lock()
+
+    def prime(self) -> None:
+        """Take the current content as already saved (it was just read from the file)."""
+        self._digest = digest(dumps(self.snapshot()))
+
+    def mark(self, soon: bool = False) -> None:
+        """Note a change: write within ``interval``, or within :data:`USER_FLUSH_S` if ``soon``."""
+        self._dirty = True
         try:
-            _write_json(path, store.to_dicts())
-        except Exception as exc:  # noqa: BLE001 - a failed snapshot must not stop the node
-            log.warning("could not save contacts: %s", exc)
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop (yet): the next flush or close() writes it
+            return
+        due = loop.time() + (min(USER_FLUSH_S, self.interval) if soon else self.interval)
+        if self._timer is not None:
+            if self._timer.when() <= due:
+                return
+            self._timer.cancel()
+        self._timer = loop.call_at(due, self._due)
 
+    def _due(self) -> None:
+        self._timer = None
+        self._task = asyncio.ensure_future(self.flush())
+
+    async def flush(self) -> None:
+        """Write the file now if it changed since the last write."""
+        async with self._lock:
+            if not self._dirty:
+                return
+            self._dirty = False
+            try:
+                value = self.snapshot()
+                await asyncio.to_thread(self._write, value)
+            except Exception as exc:  # noqa: BLE001 - a failed save must not stop the node
+                self._dirty = True
+                log.warning("could not save %s: %s", self.path.name, exc)
+
+    def _write(self, value: Any) -> None:  # in a worker thread, under the lock
+        data = dumps(value)
+        fingerprint = digest(data)
+        if fingerprint == self._digest:
+            return
+        write_atomic(self.path, data)
+        self._digest = fingerprint
+        self.writes += 1
+
+    async def close(self) -> None:
+        """Cancel the timer and write what is still unsaved."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        await self.flush()
+
+
+def _persist_contacts(store: Any, saver: DeferredSave) -> None:
+    """Mark the contact list dirty after each change (it is written later, see DeferredSave).
+
+    MeshCore Companion: this used to rewrite the whole file on each call, which on a busy
+    mesh meant a full rewrite every few seconds, and two when one wrapped method calls
+    another (``add`` of a known key calls ``update``). Transient (anonymous-request)
+    contacts change the store but are not saved; the content check skips their writes.
+    """
     for name in ("add", "add_or_overwrite", "update", "remove", "clear"):
         original = getattr(store, name, None)
         if original is None:
@@ -660,11 +746,37 @@ def _persist_contacts(store: Any, path: Path) -> None:
 
         def wrapped(*args, _original=original, **kwargs):  # noqa: ANN002, ANN003, ANN202
             result = _original(*args, **kwargs)
-            save()
+            saver.mark()
             return result
 
         setattr(store, name, wrapped)
-    store.save_snapshot = save
+
+
+def _persistent_server(base: type, contacts: DeferredSave) -> type:  # MeshCore Companion
+    """The frame server, with the commands of the user in the app saved within seconds.
+
+    The contact store cannot tell an app action from the mesh: an imported contact goes
+    through the same advert handler as one heard on the air, and a path reset calls the
+    same ``update``. The frame server can. These are the contact commands that change
+    the store: ``CMD_ADD_UPDATE_CONTACT`` and ``CMD_REMOVE_CONTACT`` (the library calls
+    the ``_save_contacts`` hook after them), ``CMD_IMPORT_CONTACT`` (stored by a deferred
+    advert loopback, which the few seconds of delay cover), and ``CMD_RESET_PATH``.
+    """
+
+    class PersistentServer(base):  # type: ignore[misc, valid-type]
+        async def _save_contacts(self) -> None:
+            await super()._save_contacts()
+            contacts.mark(soon=True)
+
+        async def _cmd_import_contact(self, data: bytes) -> None:
+            await super()._cmd_import_contact(data)
+            contacts.mark(soon=True)
+
+        async def _cmd_reset_path(self, data: bytes) -> None:
+            await super()._cmd_reset_path(data)
+            contacts.mark(soon=True)
+
+    return PersistentServer
 
 
 async def run_node(  # noqa: ANN001 - report: (dict) -> None
@@ -696,6 +808,7 @@ async def run_node(  # noqa: ANN001 - report: (dict) -> None
 
     state = Path(config["state_dir"])
     state.mkdir(parents=True, exist_ok=True)
+    remove_stale_tmp(state)  # MeshCore Companion: what a crash in the middle of a save left
     wiring = dict(config.get("wiring") or {})
     seed = dict(config.get("seed") or {})
 
@@ -755,7 +868,7 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
         spreading_factor=seed.get("spreading_factor", 7),
         coding_rate=seed.get("coding_rate", 5),
     )
-    saved_prefs = _read_json(state / "prefs.json")
+    saved_prefs = read_json(state / "prefs.json", dict)
     apply_saved_prefs(prefs, saved_prefs)
     gps = (
         Gps(str(wiring["gps_port"]), int(wiring.get("gps_baud") or 9600), saved_prefs)
@@ -770,28 +883,32 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
 
     recent = _Recent()
     logging.getLogger().addHandler(recent)
-    for attempt in range(BEGIN_ATTEMPTS):
-        recent.lines.clear()
-        try:
-            if radio.begin():
-                break
-            kind = classify_begin_failure(recent.lines)
-        except SystemExit:  # the answer of the GPIO manager to a busy or forbidden pin
-            kind = classify_begin_failure(recent.lines)
-        except Exception as exc:  # noqa: BLE001 - reported to the parent, not raised
-            recent.lines.append(str(exc))
-            kind = classify_begin_failure(recent.lines)
-        try:
-            radio.cleanup()
-        except Exception:  # noqa: BLE001, S110 - best-effort release before retrying
-            pass
-        if kind != "busy" or attempt == BEGIN_ATTEMPTS - 1:
-            detail = recent.lines[-1] if recent.lines else "radio.begin() failed"
-            raise NodeError(kind, detail)
-        await asyncio.sleep(BEGIN_BACKOFF_S * (attempt + 1))
-    logging.getLogger().removeHandler(recent)
+    try:  # MeshCore Companion: the handler goes also when begin() fails (the node is retried)
+        for attempt in range(BEGIN_ATTEMPTS):
+            recent.lines.clear()
+            try:
+                if radio.begin():
+                    break
+                kind = classify_begin_failure(recent.lines)
+            except SystemExit:  # the answer of the GPIO manager to a busy or forbidden pin
+                kind = classify_begin_failure(recent.lines)
+            except Exception as exc:  # noqa: BLE001 - reported to the parent, not raised
+                recent.lines.append(str(exc))
+                kind = classify_begin_failure(recent.lines)
+            try:
+                radio.cleanup()
+            except Exception:  # noqa: BLE001, S110 - best-effort release before retrying
+                pass
+            if kind != "busy" or attempt == BEGIN_ATTEMPTS - 1:
+                detail = recent.lines[-1] if recent.lines else "radio.begin() failed"
+                raise NodeError(kind, detail)
+            await asyncio.sleep(BEGIN_BACKOFF_S * (attempt + 1))
+    finally:
+        logging.getLogger().removeHandler(recent)
     log.info("radio ready")
 
+    node = server = None
+    contacts_saver = channels_saver = None
     try:
         seed_bytes = load_identity_seed(
             state, lambda: identity_mod.LocalIdentity().get_signing_key_bytes()
@@ -810,19 +927,30 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
             },
         )
         apply_saved_prefs(node.prefs, prefs_to_json(prefs))
+        node.prime_prefs()  # MeshCore Companion: what was just read counts as saved
 
-        for idx, name, secret in saved_channels(_read_json(state / "channels.json")):
+        # MeshCore Companion: each restored channel fires a channel_updated callback; they
+        # all land on one timed save, which finds the content unchanged and writes nothing.
+        channels_saver = DeferredSave(
+            state / "channels.json", lambda: channels_to_json(node.channels), USER_FLUSH_S
+        )
+        for idx, name, secret in saved_channels(read_json(state / "channels.json", list)):
             node.set_channel(idx, name, secret)
-        contacts = _read_json(state / "contacts.json")
-        if isinstance(contacts, list):
-            node.contacts.load_from_dicts(contacts)
-            log.info("restored %d contact(s)", node.contacts.get_count())
-        _persist_contacts(node.contacts, state / "contacts.json")
+        channels_saver.prime()
+        contacts_path = state / "contacts.json"
+        contacts = read_json(contacts_path, list)
+        if contacts:
+            try:
+                node.contacts.load_from_dicts(contacts)
+                log.info("restored %d contact(s)", node.contacts.get_count())
+            except (KeyError, TypeError, ValueError) as exc:  # MeshCore Companion
+                node.contacts.clear()
+                set_aside(contacts_path, f"has a malformed contact ({exc!r})")
+        contacts_saver = DeferredSave(contacts_path, node.contacts.to_dicts, CONTACTS_FLUSH_S)
+        contacts_saver.prime()
+        _persist_contacts(node.contacts, contacts_saver)
         node.add_push_callback(
-            "channel_updated",
-            lambda _idx, _channel: _write_json(
-                state / "channels.json", channels_to_json(node.channels)
-            ),
+            "channel_updated", lambda _idx, _channel: channels_saver.mark(soon=True)
         )
 
         await node.start()
@@ -835,7 +963,8 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
                     log.warning("GPS on %s did not open: %s", gps.port, exc)
         public_key = node.get_public_key()
         tcp = tcp or {}
-        server = (server_class or companion_mod.CompanionFrameServer)(  # MeshCore Companion
+        server_base = server_class or companion_mod.CompanionFrameServer  # MeshCore Companion
+        server = _persistent_server(server_base, contacts_saver)(  # MeshCore Companion
             bridge=node,
             companion_hash=f"{public_key[0]:02x}",
             port=int(tcp.get("port", 0)),  # MeshCore Companion
@@ -852,6 +981,14 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
         # MeshCore Companion: let the caller attach transports (BLE) to the started server.
         teardown = await setup_server(server, node) if setup_server is not None else None
     except Exception:
+        # MeshCore Companion: a node that started must stop too, or a retried start would
+        # leave its tasks running on a radio that is closed.
+        for step in (getattr(server, "stop", None), getattr(node, "stop", None)):
+            if step is not None:
+                try:
+                    await step()
+                except Exception:  # noqa: BLE001, S110 - best effort, the first error is raised
+                    pass
         radio.cleanup()
         raise
 
@@ -879,7 +1016,8 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
                 await step()
             except Exception as exc:  # noqa: BLE001 - keep going: the radio still needs freeing
                 log.warning("shutdown step failed: %s", exc)
-        node.contacts.save_snapshot()
+        for saver in (contacts_saver, channels_saver):  # MeshCore Companion
+            await saver.close()
         _forget_edge_threads(radio)
         radio.cleanup()
     return 0
@@ -969,12 +1107,25 @@ def _persistent_companion(base: type, state: Path, gps: Gps | None = None) -> ty
             self._save_prefs()
             return True
 
+        _prefs_digest: bytes | None = None  # MeshCore Companion: what prefs.json holds
+
+        def _prefs_bytes(self) -> bytes:
+            saved = prefs_to_json(self.prefs)
+            if gps is not None:
+                saved.update(gps.saved())
+            return dumps(saved)
+
+        def prime_prefs(self) -> None:
+            """MeshCore Companion: take the prefs as they are now as what prefs.json holds."""
+            self._prefs_digest = digest(self._prefs_bytes())
+
         def _save_prefs(self) -> None:
             try:
-                saved = prefs_to_json(self.prefs)
-                if gps is not None:
-                    saved.update(gps.saved())
-                _write_json(state / "prefs.json", saved)
+                data = self._prefs_bytes()
+                fingerprint = digest(data)
+                if fingerprint != self._prefs_digest:  # MeshCore Companion: skip a no-op save
+                    write_atomic(state / "prefs.json", data)
+                    self._prefs_digest = fingerprint
                 if gps is not None:
                     gps.moved = False
             except Exception as exc:  # noqa: BLE001 - a failed save must not fail the setter
