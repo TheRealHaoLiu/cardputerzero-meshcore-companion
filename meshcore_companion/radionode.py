@@ -1,36 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Jean-Pierre Martineau (MeshTerm). Modifications copyright 2026 Hao Liu.
 #
-# Derived from MeshTerm 0.13.0, meshterm/core/radionode.py
-# (https://github.com/jpmartineau/MeshTerm). Changes for MeshCore Companion, all marked
-# "MeshCore Companion:" below:
-#   - run_node() takes setup_server (called with the started frame server and node, e.g.
-#     to attach the BLE transport) and stop (an asyncio.Event that ends the node instead
-#     of stdin EOF), and returns from teardown hooks the server setup handed back;
-#   - the TCP bind address and port come from config["tcp"] (default 127.0.0.1, port 0);
-#   - config["frame_server_class"] can replace the library's CompanionFrameServer.
-"""MeshTerm runs this software MeshCore node on a radio that is wired directly to the host.
+# This file is modified. It is derived from MeshTerm 0.13.0, meshterm/core/radionode.py
+# (https://github.com/jpmartineau/MeshTerm). Changes for MeshCore Companion, marked
+# "MeshCore Companion" where they are made:
+#   - it is a module of the meshcore_companion package that the service imports and runs
+#     in its own event loop, not a file run by its path as a child process: run_node()
+#     takes stop (an asyncio.Event that ends the node instead of stdin EOF) and
+#     setup_server (called with the started frame server and node, to attach the BLE
+#     transport; the teardown it returns runs at shutdown); the module docstring
+#     describes this arrangement;
+#   - the TCP bind address and port come from config["tcp"] (default 127.0.0.1, port 0),
+#     config["frame_server_class"] can replace the library's CompanionFrameServer, and
+#     DEVICE_MODEL and the "listening" log line say so;
+#   - state files: compact JSON written in one rename by meshcore_companion.statefile;
+#     the contact list is written at most every CONTACTS_FLUSH_S, off the event loop and
+#     only when its content changed (DeferredSave), and within USER_FLUSH_S after a
+#     contact command from the app (_persistent_server); channels.json and prefs.json
+#     skip writes that change nothing, so restoring the channels at start writes nothing;
+#     stale temporary files are removed at start; a file that does not parse, or a
+#     contact list with a malformed entry, is moved to <name>.bad instead of being
+#     overwritten;
+#   - identity.key is minted only when it does not exist; a file that cannot be read, is
+#     empty or has a length LocalIdentity does not accept stops the node (NodeError kind
+#     "identity") and is left as it is; it is written with mode 0600 from creation and
+#     fsynced (save_identity_key, also used for a key imported from the app);
+#   - a failed start removes the log handler it added and stops a node or frame server
+#     it had already started, so the service can retry it.
+"""The MeshCore node of MeshCore Companion: the radio, the companion, and their state files.
 
-A board such as the AIO of the uConsole puts an SX1262 on the SPI bus of the host, with no
+The Cap LoRa-1262 puts an SX1262 on the SPI bus of the CardputerZero, with no
 microcontroller and no firmware in front of it. Thus there is no companion to talk to
-until a program runs one. This file is that program. MeshTerm starts it as a **child
-process** when it connects (:mod:`meshterm.core.spiradio` is the half of the parent).
-MeshTerm talks to it through the standard companion protocol on a loopback port, the same
-as with a network companion. MeshTerm stops it when it disconnects. Thus the node holds
-the pins of the radio for exactly as long as MeshTerm uses them.
+until a program runs one. This module is that program. The background service
+(:mod:`meshcore_companion.service`) imports it and awaits :func:`run_node` in its own
+event loop, with an ``asyncio.Event`` that ends the node: when "Run in background" is
+switched off, when a setting that changes how the node is wired up changes, and when the
+service stops. The service retries a start that failed.
 
-**Self-contained on purpose.** No part of this file imports MeshTerm. The radio library
-(``openhop_core``) is an optional install, and it is often in a different interpreter
-from the MeshTerm interpreter. The one-file build cannot import it, and on a uConsole it
-is usually in its own venv. Thus the parent runs this file by its path, with the Python
-that has the library. The contract that makes this work is: the standard library and
-``openhop_core``, and nothing else. ``tests/test_radionode.py`` makes sure that the
-contract stays true.
+:func:`run_node` prepares the board (the power and routing switches, the RF expander),
+opens the radio, builds the library's companion on it, and serves the standard companion
+protocol from the library's frame server on TCP (``127.0.0.1``, or every interface when
+the service has Wi-Fi access on). ``setup_server`` then lets the service attach the
+Bluetooth LE transport to the same frame server, which keeps one client slot for both.
+``report`` gets ``{"event": "ready", "port": …, "public_key": …}`` once the server
+listens.
 
-**This file keeps what firmware keeps.** The library keeps prefs, channels, and contacts
-only in memory. For this reason, a node that ran in this way once started with no
-channels after each restart. Now all the data that a firmware companion keeps in flash is
-kept in the state directory that the parent names:
+**This module keeps what firmware keeps.** The library keeps prefs, channels, and
+contacts only in memory. All the data that a firmware companion keeps in flash is kept in
+the state directory that the service names (``/var/lib/meshcore-companion/node``):
 
 =================  =============================================================
 ``identity.key``   the private seed of the node: its identity on the mesh
@@ -40,29 +57,28 @@ kept in the state directory that the parent names:
 ``contacts.json``  the contact list
 =================  =============================================================
 
-**This file does with a GPS what firmware does.** A board can have a wiring that names a
-GPS port (the Cap of the Cardputer Zero). This board gets the two settings that the
+The state directory is on the SD card, so the contact list, which the mesh changes every
+few seconds, is written at most every :data:`CONTACTS_FLUSH_S` and at shutdown
+(:class:`DeferredSave`). Messages queued for a phone that is not connected stay in the
+library's memory only (the frame server's message persistence hook is not used), and a
+restart of the node or the service loses them.
+
+**This module does with a GPS what firmware does.** A board can have a wiring that names
+a GPS port (the Cap of the CardputerZero). This board gets the two settings that the
 MeshCore companion firmware gives to a board with a receiver: ``gps`` to run it, and
-``gps_interval`` to set its rate. The node reports and sets them as custom variables,
-because Device config in MeshTerm already looks for them there. While the GPS runs, a
-valid fix becomes the position of the node. This is the position that its self-info
-reports, and that its adverts carry when the node shares its location (:class:`Gps`).
+``gps_interval`` to set its rate. The node reports and sets them as custom variables.
+While the GPS runs, a valid fix becomes the position of the node. This is the position
+that its self-info reports, and that its adverts carry when the node shares its location
+(:class:`Gps`).
 
-**Messages to the parent.** The parent reads exactly one JSON line from the stdout of this
-process: ``{"event": "ready", "port": …, "public_key": …}`` when the frame server
-listens, or ``{"event": "error", "kind": …, "message": …}`` if the radio did not open.
-The library prints its own diagnostics to stdout. Thus the node keeps the real stdout for
-that one line only, and sends all other output to stderr. The parent keeps stderr as the
-log of the node.
+**The release of the radio.** When the node stops, it closes the radio and puts the
+switches of the board back. The kernel also releases the GPIO lines and the open
+``spidev`` when the process ends, in any way that it ends.
 
-**The release of the radio.** The kernel releases the GPIO lines that the node requested
-through the character device, and the open ``spidev``. It releases them when the process
-ends, in any way that it ends. Thus the work is to make sure that the process ends with
-its parent. The process exits when its stdin gets to end-of-file (when the parent closes
-it, or when the parent dies and the kernel closes it). On Linux, it also asks for
-``SIGTERM`` at the moment that its parent stops.
+:func:`main`, the standalone entry point of MeshTerm (one JSON status line on stdout,
+stop at stdin EOF), is kept from MeshTerm but not used by MeshCore Companion; it runs as
+``python -m meshcore_companion.radionode --config '<json>'``.
 """
-
 from __future__ import annotations
 
 import argparse
