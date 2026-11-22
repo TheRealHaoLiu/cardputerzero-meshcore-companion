@@ -406,8 +406,16 @@ def control_socket() -> socket.socket:
 
 
 def main() -> int:
-    logging.basicConfig(level=os.environ.get("MESHCORE_COMPANION_LOG", "INFO"),
-                        format="%(levelname)s %(name)s: %(message)s")
+    # The radio library logs every packet at INFO and every weak packet as a CRC WARNING;
+    # on an SD card that is constant writing for nothing. Keep our own lifecycle lines.
+    # MESHCORE_COMPANION_LOG=DEBUG (in the unit, or by hand) brings everything back.
+    level = os.environ.get("MESHCORE_COMPANION_LOG")
+    logging.basicConfig(level=level or "WARNING", format="%(levelname)s %(name)s: %(message)s")
+    if not level:
+        for name in ("meshcore-companion", "radionode", "CompanionBleTransport",
+                     "CompanionFrameServer"):
+            logging.getLogger(name).setLevel(logging.INFO)
+        logging.getLogger("SX1262_wrapper").setLevel(logging.ERROR)
     cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
     service = Service()
     asyncio.run(service.serve(control_socket()))
