@@ -76,7 +76,7 @@ python3 packaging/build_deb.py --openhop ../forks/openhop_core --out dist
 ```
 
 - `--openhop` is a git checkout of the openHop core fork
-  (https://github.com/TheRealHaoLiu/openhop_core, branch `feat/ble-transport`). The build
+  (https://github.com/TheRealHaoLiu/openhop_core, branch `feat/companion-ble-transport`). The build
   bundles its committed HEAD and refuses a checkout with uncommitted or untracked
   changes; the commit is recorded in `/usr/lib/meshcore-companion/VENDORED`.
 - The Python dependencies are pinned in `WHEELS` in the script and downloaded from PyPI
