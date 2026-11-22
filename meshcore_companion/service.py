@@ -32,6 +32,8 @@ IDLE_EXIT_S = 20  # background off: exit after this long without a tile connecte
 PAIR_WINDOW_S = 120
 PAIR_WINDOW_MAX_S = 300  # the longest pairing window the control socket may ask for
 PAIR_GRACE_S = 30  # a pairing that started in the window may finish this much later
+RETRY_FIRST_S = 30  # background on: a failed node or Bluetooth start is retried after this,
+RETRY_MAX_S = 600  # doubling up to this, and back to the first delay once it works
 _ADAPTER = "/org/bluez/hci0"
 
 
@@ -47,6 +49,8 @@ class Service:
         self.node: Any = None
         self.ble: Any = None
         self.node_error: Optional[str] = None
+        self._failing = False  # the node start failed and is being retried
+        self._ble_task: Optional[asyncio.Task] = None
         self.pair_until = 0.0
         self._pair_timer: Optional[asyncio.TimerHandle] = None
         # Bluetooth devices that paired while this service's pairing window was open: the
@@ -72,6 +76,7 @@ class Service:
         if self.running:
             return
         self.node_error = None
+        self._failing = False
         self.node_stop = asyncio.Event()
         self.node_task = asyncio.create_task(self._run_node(self.node_stop))
 
@@ -90,54 +95,118 @@ class Service:
             self.start_node()
 
     async def _run_node(self, stop: asyncio.Event) -> None:
+        """Run the node until ``stop``; with "Run in background" on, retry a failed start.
+
+        The radio may be held by another app, its device node may not be there yet at
+        boot, or the Bluetooth daemon may not be up: each is retried after
+        :data:`RETRY_FIRST_S`, doubling to :data:`RETRY_MAX_S`. The journal gets one line
+        when the node starts failing and one when it recovers, not one per attempt.
+        """
         from . import radionode  # heavy imports only when the radio runs
 
-        conf = {
-            "state_dir": str(self.state_dir / "node"),
-            "wiring": cfg.CAP_LORA_1262,
-            "seed": cfg.SEED,
-            "model": "Cap LoRa-1262",
-            "tcp": {
-                "bind": "0.0.0.0" if self.settings["wifi"] else "127.0.0.1",
-                "port": cfg.TCP_PORT,
-            },
-            "frame_server_class": _frame_server_class(self),
-        }
+        delay = RETRY_FIRST_S
+        while not stop.is_set():
+            conf = {
+                "state_dir": str(self.state_dir / "node"),
+                "wiring": cfg.CAP_LORA_1262,
+                "seed": cfg.SEED,
+                "model": "Cap LoRa-1262",
+                "tcp": {
+                    "bind": "0.0.0.0" if self.settings["wifi"] else "127.0.0.1",
+                    "port": cfg.TCP_PORT,
+                },
+                "frame_server_class": _frame_server_class(self),
+            }
 
-        def report(message: Dict[str, Any]) -> None:
-            if message.get("event") == "error":
-                self.node_error = _friendly(message.get("kind"), message.get("message"))
-            self.broadcast({"event": "status", "status": self.status()})
+            def report(message: Dict[str, Any]) -> None:
+                if message.get("event") == "error":
+                    self.node_error = _friendly(message.get("kind"), message.get("message"))
+                self.broadcast({"event": "status", "status": self.status()})
 
-        try:
-            await radionode.run_node(conf, report, setup_server=self._setup_server, stop=stop)
-        except Exception as exc:  # noqa: BLE001 - reported to the tile, not fatal
-            self.node_error = self.node_error or _friendly(getattr(exc, "kind", None), str(exc))
-            log.error("node failed: %s", exc)
-        finally:
-            self.server = self.node = self.ble = None
-            self.broadcast({"event": "status", "status": self.status()})
+            came_up = False
+            QUIET.active = self._failing  # a retried start: keep its lines out of the journal
+            try:
+                await radionode.run_node(conf, report, setup_server=self._setup_server, stop=stop)
+                return
+            except Exception as exc:  # noqa: BLE001 - reported to the tile, not fatal
+                came_up = self.server is not None
+                self.node_error = _friendly(getattr(exc, "kind", None), str(exc))
+                if not self._failing:
+                    retry = (f"; retrying in {delay} s, then less often"
+                             if self.settings["background"] else "")
+                    log.error("node failed: %s: %s%s", getattr(exc, "kind", "failed"), exc, retry)
+                    self._failing = True
+            finally:
+                QUIET.active = False
+                self.server = self.node = self.ble = None
+                self.broadcast({"event": "status", "status": self.status()})
+            if not self.settings["background"]:
+                return
+            if came_up:
+                delay = RETRY_FIRST_S  # it ran, then failed: start over with a short wait
+            try:
+                await asyncio.wait_for(stop.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+            delay = min(delay * 2, RETRY_MAX_S)
 
     async def _setup_server(self, server: Any, node: Any):
         self.server, self.node = server, node
+        QUIET.active = False
+        if self._failing:
+            log.info("node is up again")
+            self._failing = False
+            self.node_error = None
         if not self.settings["bluetooth"]:
             return None
+        self._ble_task = asyncio.create_task(self._keep_ble(server))
+        return self._stop_ble
+
+    async def _keep_ble(self, server: Any) -> None:
+        """Register the BLE transport; if BlueZ refuses, retry while the node runs."""
         from openhop_core.companion.frame_server.ble_transport import CompanionBleTransport
 
-        ble = CompanionBleTransport(
-            server,
-            security="authenticated" if self.settings["pairing"] == "code" else "encrypt",
-            passkey_callback=self._on_passkey,
-        )
-        try:
-            await ble.start()
-        except Exception as exc:  # noqa: BLE001 - the node still works over TCP
-            log.error("Bluetooth did not start: %s", exc)
-            self.node_error = f"bluetooth: {exc}"
-            return None
-        self.ble = ble
-        await self._apply_pairable()
-        return ble.stop
+        delay, failing = RETRY_FIRST_S, False
+        while True:
+            ble = CompanionBleTransport(
+                server,
+                security="authenticated" if self.settings["pairing"] == "code" else "encrypt",
+                passkey_callback=self._on_passkey,
+            )
+            try:
+                await ble.start()
+            except asyncio.CancelledError:
+                await ble.stop()
+                raise
+            except Exception as exc:  # noqa: BLE001 - the node still works over TCP
+                if not failing:
+                    log.error("Bluetooth did not start: %s; retrying in %d s, then less often",
+                              exc, delay)
+                    failing = True
+                self.node_error = f"bluetooth: {exc}"
+                self.broadcast({"event": "status", "status": self.status()})
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RETRY_MAX_S)
+                continue
+            self.ble = ble
+            if failing:
+                log.info("Bluetooth is up again")
+                if str(self.node_error).startswith("bluetooth:"):
+                    self.node_error = None
+            await self._apply_pairable()
+            self.broadcast({"event": "status", "status": self.status()})
+            return
+
+    async def _stop_ble(self) -> None:
+        task, self._ble_task = self._ble_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if self.ble is not None:
+            await self.ble.stop()
 
     # ------------------------------------------------------------------
     # Bluetooth pairing window and paired devices (BlueZ over D-Bus)
@@ -395,7 +464,9 @@ class Service:
         raise ValueError(f"unknown command {cmd!r}")
 
     async def serve(self, sock: socket.socket) -> None:
-        server = await asyncio.start_unix_server(self.handle_client, sock=sock)
+        # The socket belongs to systemd (socket activation): never unlink its path on close.
+        server = await asyncio.start_unix_server(self.handle_client, sock=sock,
+                                                 cleanup_socket=False)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self.stopping.set)
@@ -408,7 +479,8 @@ class Service:
                 except asyncio.TimeoutError:
                     pass
                 idle = time.monotonic() - self._last_client
-                if not self.running and not self.clients and idle > IDLE_EXIT_S:
+                if (not self.settings["background"] and not self.running and not self.clients
+                        and idle > IDLE_EXIT_S):
                     log.info("background off and no tile connected: exiting")
                     break
         await self.stop_node()
@@ -514,9 +586,20 @@ _ERRORS = {
 
 
 def _friendly(kind: Any, detail: Any) -> str:
-    """A short line for the tile; the full detail goes to the journal."""
-    log.error("node: %s: %s", kind, detail)
+    """A short line for the tile; the full detail goes to the journal (from the caller)."""
     return _ERRORS.get(str(kind), f"Radio failed: {str(detail)[:60]}")
+
+
+class _Quiet(logging.Filter):
+    """Drops log records while a retried node start runs (our own lines still pass)."""
+
+    active = False
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not self.active or record.name == log.name or record.levelno >= logging.CRITICAL
+
+
+QUIET = _Quiet()
 
 
 def _lan_address() -> str:
@@ -551,10 +634,17 @@ def control_socket() -> socket.socket:
 def main() -> int:
     # The radio library logs every packet at INFO and every weak packet as a CRC WARNING;
     # on an SD card that is constant writing for nothing. Keep our own lifecycle lines.
-    # MESHCORE_COMPANION_LOG=DEBUG (in the unit, or by hand) brings everything back.
-    level = os.environ.get("MESHCORE_COMPANION_LOG")
-    logging.basicConfig(level=level or "WARNING", format="%(levelname)s %(name)s: %(message)s")
-    if not level:
+    # MESHCORE_COMPANION_LOG=DEBUG (in the unit, or by hand) brings everything back; the
+    # name is not case-sensitive, and a value that is not a level name keeps the default.
+    level = os.environ.get("MESHCORE_COMPANION_LOG", "").strip().upper()
+    known = level in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+    logging.basicConfig(level=level if known else "WARNING",
+                        format="%(levelname)s %(name)s: %(message)s")
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(QUIET)
+    if level and not known:
+        log.warning("MESHCORE_COMPANION_LOG=%r is not a level name; using the default", level)
+    if not known:
         for name in ("meshcore-companion", "radionode", "CompanionBleTransport",
                      "CompanionFrameServer"):
             logging.getLogger(name).setLevel(logging.INFO)
