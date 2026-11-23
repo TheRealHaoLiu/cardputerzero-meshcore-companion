@@ -2,7 +2,7 @@
 
 Draws straight to the framebuffer and reads the keyboard through evdev, like the
 launcher's own apps. Keys: F/X (or arrows) move, ENTER toggles or opens, ESC goes back,
-holding ESC leaves.
+holding ESC three seconds leaves (a hint and a countdown show from half a second on).
 
 Test hooks (environment): ``MCC_SCREEN_PNG`` saves each frame to a PNG instead of the
 framebuffer; ``MCC_TEST_KEYS`` is a FIFO of ``<code> <1|0>`` lines added to the keyboard;
@@ -31,7 +31,8 @@ FONTS = "/usr/share/APPLaunch/share/font/"
 FBIOBLANK = 0x4611
 
 ESC, ENTER, KPENTER, UP, DOWN, KEY_F, KEY_X = 1, 28, 96, 103, 108, 33, 45
-EXIT_HOLD = 1.0
+EXIT_HOLD = 3.0  # seconds of ESC to leave, as in M5Stack's own apps (the launcher ends an app held that long anyway)
+EXIT_HINT = 0.5  # ... and from here on the hold shows a hint and a countdown; a shorter press is a tap
 STATUS_EVERY_S = 2.0  # how often the tile asks for the status (it redraws only on a change)
 RECONNECT_EVERY_S = 2.0  # after the service went away (it restarted): try again this often
 RECONNECT_TIMEOUT_S = 5.0
@@ -131,6 +132,7 @@ class App:
         self.c, self.screen, self.keys, self.path = control, screen, keys, path
         self._reconnect_at = 0.0
         self._footer_message = False  # the frame on screen shows a timed message
+        self.esc_down: Optional[float] = None  # when ESC went down, while it is held
         self._asked = False  # the user asked for a look for the Cap; its result is announced
         self.status: Dict[str, Any] = {}
         self.page = "main"
@@ -374,6 +376,15 @@ class App:
                 if self.page == "main" and self.no_cap()
                 else "F/X move · ENTER select · ESC back")
         d.text((8, H - 16), foot, font=self.f_small, fill=ACCENT if self._footer_message else DIM)
+        held = time.monotonic() - self.esc_down if self.esc_down is not None else 0.0
+        if held >= EXIT_HINT:  # over everything, like the launcher's own "Hold ESC 3s to return home"
+            box = (40, 104, W - 40, 146)
+            d.rounded_rectangle(box, 8, fill=SEL, outline=FG)
+            d.text((W // 2, box[1] + 13), f"Hold ESC to return home  {max(0.0, EXIT_HOLD - held):.1f} s",
+                   font=self.f_small, fill=FG, anchor="mm")
+            x0, x1, y = box[0] + 12, box[2] - 12, box[1] + 27
+            d.rounded_rectangle((x0, y, x1, y + 6), 3, fill=BG)
+            d.rounded_rectangle((x0, y, x0 + max(6, (x1 - x0) * min(1.0, held / EXIT_HOLD)), y + 6), 3, fill=ACCENT)
         self.screen.show(img)
 
     def draw_pair_window(self, d: ImageDraw.ImageDraw) -> None:
@@ -424,25 +435,28 @@ class App:
     def run(self) -> None:
         if self.c is not None:
             self.call("subscribe")
-        esc_down: Optional[float] = None
         last_poll = 0.0
         self.draw()
         while self.running:
             changed = False
-            for code, down in self.keys.read(0.2):
+            # While ESC is held the countdown is redrawn ten times a second
+            for code, down in self.keys.read(0.1 if self.esc_down is not None else 0.2):
                 if code == ESC:
                     if down:
-                        esc_down = time.monotonic()
+                        self.esc_down = time.monotonic()
                     else:
-                        if esc_down is not None and time.monotonic() - esc_down < EXIT_HOLD:
+                        # Let go once the hint was up: a hold called off, not a tap, so it does not also go back
+                        if self.esc_down is not None and time.monotonic() - self.esc_down < EXIT_HINT:
                             self.back()
-                        esc_down = None
+                        self.esc_down = None
                     changed = True
                 elif down:
                     self.on_key(code)
                     changed = True
-            if esc_down is not None and time.monotonic() - esc_down >= EXIT_HOLD:
+            if self.esc_down is not None and time.monotonic() - self.esc_down >= EXIT_HOLD:
                 break
+            if self.esc_down is not None and time.monotonic() - self.esc_down >= EXIT_HINT:
+                changed = True
             if self.c is None:
                 if time.monotonic() >= self._reconnect_at:
                     changed |= self.reconnect()
