@@ -36,9 +36,13 @@ if [ "$1" = "configure" ]; then
         if [ -z "$2" ]; then
             systemctl start $UNITS || true
         else
-            # An upgrade: a new socket unit takes effect only when the socket restarts
-            # (the service is stopped now), and the service starts again only if it ran.
-            systemctl try-restart meshcore-companion.socket || true
+            # An upgrade: prerm stopped the socket and the service. The socket starts
+            # again unless it is disabled (without it the tile cannot reach or start the
+            # service, which is the usual state with no Cap attached: the service is not
+            # running then), and the service starts again only if it ran.
+            if systemctl is-enabled --quiet meshcore-companion.socket; then
+                systemctl start meshcore-companion.socket || true
+            fi
             if [ -e "$MARK" ]; then
                 systemctl start meshcore-companion.service || true
             elif dpkg --compare-versions "$2" le-nl "0.1.0-1" \
