@@ -131,6 +131,7 @@ class App:
         self.c, self.screen, self.keys, self.path = control, screen, keys, path
         self._reconnect_at = 0.0
         self._footer_message = False  # the frame on screen shows a timed message
+        self._asked = False  # the user asked for a look for the Cap; its result is announced
         self.status: Dict[str, Any] = {}
         self.page = "main"
         self.sel = 0
@@ -157,8 +158,33 @@ class App:
             self.say(f"Error: {exc}", 4)
             return {}
         if "status" in reply:
-            self.status = reply["status"]
+            self.set_status(reply["status"])
         return reply
+
+    def set_status(self, status: Dict[str, Any]) -> None:
+        """Take a new status, and say what happened to the Cap when that changed."""
+        old, self.status = self.status, status
+        if self.no_cap() and old.get("running"):
+            self.say("LoRa Cap removed: MeshCore stopped", 6)
+        elif self.no_cap() and self._asked:
+            self.say("No LoRa Cap found", 4)
+        elif status.get("running") and not old.get("running") and self._asked:
+            self.say("LoRa Cap found: MeshCore is running", 4)
+        else:
+            return
+        self._asked = False
+        if self.page == "main":
+            self.sel = 0
+
+    def no_cap(self) -> bool:
+        """The node is off because the Cap LoRa-1262 is not attached (not an error)."""
+        return self.status.get("cap") is False and not self.status.get("starting")
+
+    def look(self) -> None:
+        self._asked = True
+        self.say("Checking for the LoRa Cap…", 3)
+        self.draw()
+        self.call("look")
 
     def lost(self) -> None:
         """The service went away (a restart, or it stopped): show it and connect again."""
@@ -201,7 +227,10 @@ class App:
         s = self.status.get("settings", {})
         onoff = lambda key: "ON" if s.get(key) else "OFF"  # noqa: E731
         if self.page == "main":
-            return [
+            # Without the Cap the node is off and nothing looks for it by itself (a look
+            # powers whatever Cap is attached): the first row says so, and looks.
+            check = [Row("No LoRa Cap: MeshCore is off", lambda: "Check ›", self.look)]
+            return (check if self.no_cap() else []) + [
                 Row("Run in background", lambda: onoff("background"),
                     lambda: self.toggle("background")),
                 Row("Bluetooth", lambda: onoff("bluetooth"), lambda: self.toggle("bluetooth")),
@@ -251,11 +280,14 @@ class App:
             self.goto("pairing")
         elif self.page == "pairing":
             self.goto("main")
-            self.sel = 3
+            self.sel = len(self.rows()) - 1
         else:
             self.running = False
 
     def start_pairing(self) -> None:
+        if self.no_cap():
+            self.say("Put the LoRa Cap on, then Check", 4)
+            return
         if not self.status.get("running"):
             self.say("Turn on Run in background first")
             return
@@ -283,6 +315,8 @@ class App:
         st = self.status
         if self.c is None:
             state, color = "Restarting", ACCENT
+        elif self.no_cap():
+            state, color = "No Cap", DIM
         elif st.get("error") and not st.get("running"):
             state, color = "Error", WARN
         elif st.get("running"):
@@ -297,7 +331,7 @@ class App:
         d.ellipse((W - 82, 10, W - 74, 18), fill=color)
         d.text((W - 70, 6), state, font=self.f_small, fill=color)
 
-        if self.page == "main":
+        if self.page == "main" and not self.no_cap():  # else the first row is in its place
             bits = [st.get("node_name") or "—"]
             if st.get("contacts") is not None:
                 bits.append(f"{st['contacts']} contacts")
@@ -312,8 +346,10 @@ class App:
         if self.page == "pair_window":
             self.draw_pair_window(d)
         else:
-            top = 46 if self.page == "main" else 30
-            for i, row in enumerate(self.rows()):
+            top = 30 if self.page != "main" else 26 if self.no_cap() else 46
+            rows = self.rows()
+            self.sel = max(0, min(self.sel, len(rows) - 1))  # the rows change with the status
+            for i, row in enumerate(rows):
                 y = top + i * 25
                 if y > H - 30:
                     break
@@ -333,7 +369,10 @@ class App:
             d.text((W // 2, 100), "ENTER yes · ESC no", font=self.f_small, fill=DIM, anchor="mm")
 
         self._footer_message = time.monotonic() < self.message_until
-        foot = self.message if self._footer_message else "F/X move · ENTER select · ESC back"
+        foot = (self.message if self._footer_message
+                else "Put the LoRa Cap on, then Check · ESC back"
+                if self.page == "main" and self.no_cap()
+                else "F/X move · ENTER select · ESC back")
         d.text((8, H - 16), foot, font=self.f_small, fill=ACCENT if self._footer_message else DIM)
         self.screen.show(img)
 
@@ -375,7 +414,7 @@ class App:
     def on_event(self, ev: Dict[str, Any]) -> None:
         kind = ev.get("event")
         if kind == "status":
-            self.status = ev["status"]
+            self.set_status(ev["status"])
         elif kind == "passkey":
             self.passkey = ev["passkey"]
         elif kind == "pairing_done" and self.page == "pair_window":

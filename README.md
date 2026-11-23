@@ -19,6 +19,27 @@ Cap for other radio apps. With it on, a start that fails (the radio is held by a
 app, or Bluetooth is not up yet at boot) is retried after 30 seconds, then less often, up
 to every 10 minutes.
 
+The node runs only while the Cap LoRa-1262 is attached, and the service keeps away from
+any other Cap (they use the same pins for other things):
+
+- When the service starts (at boot, or when the tile is opened) it looks for the Cap
+  once: it switches the 5 V output of the header (`ext_5v_out`) on for a tenth of a
+  second and makes one I2C read at the address of the Cap's expander (0x43). Nothing
+  else on the header is touched until the Cap LoRa-1262 has answered.
+- Without it nothing starts and nothing is retried: the radio library is not loaded,
+  the tile shows "No Cap", and the service exits after 20 seconds without a tile. It
+  never looks on a timer, because a look powers whatever Cap is attached. After putting
+  the Cap on with the device running, open the tile (it looks when it opens) or press
+  "Check" in it.
+- While the node runs, one I2C read a second checks that the Cap is still there. When
+  it comes off, the node stops: the radio pins and the serial port are released, the
+  header power goes back off, and Bluetooth stops advertising. Messages queued for the
+  app are lost, as at any restart of the node. Give it a few seconds before putting a
+  different Cap on.
+
+M5Stack says not to swap Caps with the CardputerZero powered on. A Cap with the same
+expander chip at the same address would be taken for the Cap LoRa-1262.
+
 ## Security
 
 The companion protocol has no login. What a client can do depends on how it connects:

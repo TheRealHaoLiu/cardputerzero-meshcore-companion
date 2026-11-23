@@ -8,6 +8,8 @@ Protocol: one JSON object per line, each request answered by one line
 * ``{"cmd": "subscribe"}``: afterwards the service also pushes events
   ``{"event": "status", "status": {...}}``, ``{"event": "passkey", "passkey": "123456"}``
   and ``{"event": "pairing_done"}``
+* ``{"cmd": "look"}``: look for the Cap again, after a look that found none (the status
+  has ``"cap": false``); the result comes as a status event
 * ``{"cmd": "pair", "seconds": 120}`` / ``{"cmd": "pair_stop"}``
 * ``{"cmd": "paired"}`` and ``{"cmd": "forget", "device": "<path>|all"}``
 """

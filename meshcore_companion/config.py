@@ -35,6 +35,9 @@ CAP_LORA_1262 = {
     "rxen_pin": -1,
     "en_pins": None,
     "leds": ["ext_5v_out=1", "ext_usb_gpio_fun=0"],
+    # The switches that a look for the Cap needs: power on the header. Only these are
+    # set until the Cap has answered (a different Cap may be attached).
+    "probe_leds": ["ext_5v_out=1"],
     "pi4io_bus": 1,
     "pi4io_address": 0x43,
     "pi4io_high": [0],

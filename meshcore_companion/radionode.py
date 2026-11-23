@@ -11,7 +11,7 @@
 #     transport; the teardown it returns runs at shutdown); the module docstring
 #     describes this arrangement;
 #   - the TCP bind address and port come from config["tcp"] (default 127.0.0.1, port 0),
-#     config["frame_server_class"] can replace the library's CompanionFrameServer, and
+#     config["frame_server_factory"] can replace the library's CompanionFrameServer, and
 #     DEVICE_MODEL and the "listening" log line say so;
 #   - state files: compact JSON written in one rename by meshcore_companion.statefile;
 #     the contact list is written at most every CONTACTS_FLUSH_S, off the event loop and
@@ -26,7 +26,19 @@
 #     "identity") and is left as it is; it is written with mode 0600 from creation and
 #     fsynced (save_identity_key, also used for a key imported from the app);
 #   - a failed start removes the log handler it added and stops a node or frame server
-#     it had already started, so the service can retry it.
+#     it had already started, so the service can retry it;
+#   - a header that may carry a different Cap: prepare_board() switches on only the
+#     power (probe_leds), reads the ID of the expander, and touches nothing else on the
+#     header unless the Cap LoRa-1262 answers; run_node() prepares the board before it
+#     loads the radio library; cap_present() makes the same read for the service while
+#     the node runs (_pi4io_id);
+#   - config["frame_server_factory"] replaces config["frame_server_class"]: it is called
+#     for the class once the board is prepared;
+#   - the node can start again in the same process: the thread that watches the IRQ pin
+#     wakes every EDGE_POLL_S (_short_edge_polls) and so ends when the radio is cleaned
+#     up, in place of _forget_edge_threads(), which left it holding the pin for up to
+#     30 s; and a SystemExit of the library in a cleanup does not end the service
+#     (_release).
 """The MeshCore node of MeshCore Companion: the radio, the companion, and their state files.
 
 The Cap LoRa-1262 puts an SX1262 on the SPI bus of the CardputerZero, with no
@@ -391,11 +403,9 @@ def drive_pi4io(bus: int, address: int, high: list[int], dev: Path = Path("/dev"
             fcntl.ioctl(fd, _I2C_SLAVE, address)
         except OSError as exc:
             raise NodeError("busy", f"{address:#04x} on {path} is held: {exc}") from None
-        try:
-            os.write(fd, bytes([_PI4IO_ID]))
-            ident = os.read(fd, 1)[0]
-        except OSError:
-            raise NodeError("absent", f"nothing answers at {address:#04x} on {path}") from None
+        ident = _pi4io_id(fd)
+        if ident is None:
+            raise NodeError("absent", f"nothing answers at {address:#04x} on {path}")
         if ident >> 5 != _PI4IO_MAKER:
             raise NodeError(
                 "absent", f"{address:#04x} on {path} is not a PI4IOE5V6408 (ID {ident:#04x})"
@@ -411,6 +421,49 @@ def drive_pi4io(bus: int, address: int, high: list[int], dev: Path = Path("/dev"
     log.info("PI4IO %#04x on %s: pins %s high", address, path, high)
 
 
+def _pi4io_id(fd: int) -> int | None:  # MeshCore Companion
+    """The ID register of the expander that ``fd`` points at, or ``None`` when nothing answers."""
+    try:
+        os.write(fd, bytes([_PI4IO_ID]))
+        return os.read(fd, 1)[0]
+    except OSError:
+        return None
+
+
+def cap_present(wiring: dict, dev: Path = Path("/dev")) -> bool:  # MeshCore Companion
+    """Is the Cap still on the header? One read of the ID register of its RF expander.
+
+    The expander is on the Cap, so an answer from a PI4IOE5V6408 at its address means the
+    Cap is attached, and no answer (or a different chip) means it is not. The service
+    asks every second while the node runs, to stop the node when the Cap comes off.
+
+    The function switches nothing. The expander answers only while the header has power
+    (measured on the CardputerZero: never with ``ext_5v_out`` off, 17 ms after it goes
+    on), which the running node keeps on. The look that needs the power switched on is
+    the one in :func:`prepare_board`, when the node starts.
+
+    A board whose wiring names no expander, or a bus that cannot be opened, gives
+    ``True``: this function cannot tell.
+    """
+    bus = int(wiring.get("pi4io_bus", -1))
+    if bus < 0:
+        return True
+    import fcntl
+
+    try:
+        fd = os.open(dev / f"i2c-{bus}", os.O_RDWR)
+    except OSError:
+        return True
+    try:
+        fcntl.ioctl(fd, _I2C_SLAVE, int(wiring.get("pi4io_address", 0x43)))
+        ident = _pi4io_id(fd)
+    except OSError:
+        return True  # a kernel driver holds the address
+    finally:
+        os.close(fd)
+    return ident is not None and ident >> 5 == _PI4IO_MAKER
+
+
 def prepare_board(wiring: dict) -> list[tuple[Path, str]]:
     """Switch on the parts that the chip must have before the radio library uses it.
 
@@ -419,11 +472,26 @@ def prepare_board(wiring: dict) -> list[tuple[Path, str]]:
     function returns the previous states of the switches. The caller puts them back when
     the node ends, also when the node did not start. Thus a failed start leaves the header
     as it was.
+
+    MeshCore Companion: the header may carry a different Cap, which uses the same pins for
+    other things. Thus the function first sets only the ``probe_leds`` of the wiring (the
+    power), and reads the ID of the expander. Without the answer of this Cap it puts the
+    power back and stops (``absent``): a different Cap gets a tenth of a second of power
+    and one I2C read at an address, and nothing else. The other switches, the write to
+    the expander, and all that the radio library does to the pins come after the answer.
     """
-    previous = set_leds(list(wiring.get("leds") or ()), root=LEDS)
-    if previous:
-        time.sleep(POWER_SETTLE_S)
+    leds = list(wiring.get("leds") or ())
+    probe = [entry for entry in wiring.get("probe_leds") or () if entry in leds]
+    previous = set_leds(probe, root=LEDS)
     try:
+        if previous:
+            time.sleep(POWER_SETTLE_S)
+            if not cap_present(wiring):
+                raise NodeError("absent", "no Cap LoRa-1262 answers on the header")
+        rest = set_leds([entry for entry in leds if entry not in probe], root=LEDS)
+        previous += rest
+        if rest and not probe:
+            time.sleep(POWER_SETTLE_S)
         if int(wiring.get("pi4io_bus", -1)) >= 0:
             drive_pi4io(
                 int(wiring["pi4io_bus"]),
@@ -812,16 +880,6 @@ async def run_node(  # noqa: ANN001 - report: (dict) -> None
     """
     import importlib
 
-    try:
-        rt = importlib.import_module(RUNTIME)
-        companion_mod = importlib.import_module(f"{RUNTIME}.companion")
-        models = importlib.import_module(f"{RUNTIME}.companion.models")
-        identity_mod = importlib.import_module(f"{RUNTIME}.protocol.identity")
-        sx1262 = importlib.import_module(f"{RUNTIME}.hardware.sx1262_wrapper")
-    except ImportError as exc:
-        raise NodeError("runtime", f"{RUNTIME} is not importable here ({exc})") from exc
-    log.info("node runtime %s %s (%s)", RUNTIME, getattr(rt, "__version__", "?"), sys.executable)
-
     state = Path(config["state_dir"])
     state.mkdir(parents=True, exist_ok=True)
     remove_stale_tmp(state)  # MeshCore Companion: what a crash in the middle of a save left
@@ -836,6 +894,20 @@ async def run_node(  # noqa: ANN001 - report: (dict) -> None
     # also when the radio did not start. Thus a failed start leaves the header as it was.
     switched = prepare_board(wiring)
     try:
+        # MeshCore Companion: the library loads after the board answered, so a start
+        # without the Cap costs one look and no import.
+        try:
+            rt = importlib.import_module(RUNTIME)
+            companion_mod = importlib.import_module(f"{RUNTIME}.companion")
+            models = importlib.import_module(f"{RUNTIME}.companion.models")
+            identity_mod = importlib.import_module(f"{RUNTIME}.protocol.identity")
+            sx1262 = importlib.import_module(f"{RUNTIME}.hardware.sx1262_wrapper")
+        except ImportError as exc:
+            raise NodeError("runtime", f"{RUNTIME} is not importable here ({exc})") from exc
+        log.info(
+            "node runtime %s %s (%s)", RUNTIME, getattr(rt, "__version__", "?"), sys.executable
+        )
+        factory = config.get("frame_server_factory")  # MeshCore Companion
         return await _serve(
             state,
             wiring,
@@ -847,7 +919,7 @@ async def run_node(  # noqa: ANN001 - report: (dict) -> None
             companion_mod=companion_mod,
             identity_mod=identity_mod,
             tcp=dict(config.get("tcp") or {}),  # MeshCore Companion
-            server_class=config.get("frame_server_class"),  # MeshCore Companion
+            server_class=factory() if factory is not None else None,  # MeshCore Companion
             setup_server=setup_server,  # MeshCore Companion
             stop=stop,  # MeshCore Companion
         )
@@ -896,6 +968,7 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
     kwargs = radio_kwargs(inspect.signature(SX1262Radio.__init__).parameters, wiring, prefs)
     log.info("radio config %s", " ".join(f"{k}={v}" for k, v in kwargs.items()))
     radio = SX1262Radio(**kwargs)
+    _short_edge_polls(radio)  # MeshCore Companion
 
     recent = _Recent()
     logging.getLogger().addHandler(recent)
@@ -911,10 +984,7 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
             except Exception as exc:  # noqa: BLE001 - reported to the parent, not raised
                 recent.lines.append(str(exc))
                 kind = classify_begin_failure(recent.lines)
-            try:
-                radio.cleanup()
-            except Exception:  # noqa: BLE001, S110 - best-effort release before retrying
-                pass
+            _release(radio)  # MeshCore Companion
             if kind != "busy" or attempt == BEGIN_ATTEMPTS - 1:
                 detail = recent.lines[-1] if recent.lines else "radio.begin() failed"
                 raise NodeError(kind, detail)
@@ -1005,7 +1075,7 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
                     await step()
                 except Exception:  # noqa: BLE001, S110 - best effort, the first error is raised
                     pass
-        radio.cleanup()
+        _release(radio)  # MeshCore Companion
         raise
 
     log.info("node %s… listening on %s:%d", public_key.hex()[:16], tcp.get("bind", "127.0.0.1"), port)
@@ -1034,33 +1104,57 @@ async def _serve(  # noqa: PLR0913 - the library modules run_node imported, hand
                 log.warning("shutdown step failed: %s", exc)
         for saver in (contacts_saver, channels_saver):  # MeshCore Companion
             await saver.close()
-        _forget_edge_threads(radio)
-        radio.cleanup()
+        _release(radio)  # MeshCore Companion
     return 0
 
 
-def _forget_edge_threads(radio: Any) -> None:
-    """Save the radio cleanup two seconds of wait for a thread that cannot hear it.
+#: MeshCore Companion: how often the thread that watches the IRQ pin wakes to see whether
+#: it must stop. The library waits 30 s there.
+EDGE_POLL_S = 0.5
+
+
+def _short_edge_polls(radio: Any) -> None:  # MeshCore Companion
+    """Make the thread that watches the IRQ pin end soon after the radio is cleaned up.
 
     The library watches the IRQ pin from a daemon thread that waits in a 30-second
-    ``poll``. The stop event of the thread cannot cut this poll short. ``cleanup()`` joins
-    that thread for a maximum of two seconds before it closes the pins. Thus each shutdown
-    waited the full two seconds for no result. On the Cardputer Zero, that was 2.2 s of a
-    3.4 s exit, and the launcher gives only three seconds between its SIGTERM and its
-    SIGKILL (measured 2026-10-06). The thread is a daemon, and the kernel releases its line
-    when the process ends. Thus this function tells the thread to stop, then removes it
-    from the thread list of the manager. Then the cleanup closes the pins and does not wait
-    for the thread. If a library keeps its threads in a different place, this function
-    does nothing: the cleanup is slower, but not wrong.
+    ``poll``, which its stop event cannot cut short. The kernel keeps the pin taken until
+    that ``poll`` returns, also after ``cleanup()`` closed it. With a radio that sends no
+    interrupt (the Cap was pulled off), that is up to 30 s in which a new start in this
+    process finds the pin busy (measured 2026-11-22: the Cap back on after 8 s, "GPIO Pin
+    23 is already in use"). Thus this function gives each pin a ``poll`` that waits
+    :data:`EDGE_POLL_S` at most, before its thread starts: the thread sees the stop event
+    in that time, ``cleanup()`` joins it, and the pin is free when ``cleanup()`` returns.
+    If a library keeps its pins in a different place, this function does nothing: a
+    start soon after a stop then fails as busy and is retried.
     """
     manager = getattr(radio, "_gpio_manager", None)
-    stops = getattr(manager, "_edge_stop_events", None)
-    threads = getattr(manager, "_edge_threads", None)
-    if not isinstance(stops, dict) or not isinstance(threads, dict):
+    start = getattr(manager, "_start_edge_detection", None)
+    pins = getattr(manager, "_pins", None)
+    if start is None or not isinstance(pins, dict):
         return
-    for stop in stops.values():
-        stop.set()
-    threads.clear()
+
+    def start_with_short_polls(pin_number: int) -> None:
+        gpio = pins.get(pin_number)
+        poll = getattr(gpio, "poll", None)
+        if poll is not None:
+            gpio.poll = lambda timeout=None: poll(
+                EDGE_POLL_S if timeout is None else min(timeout, EDGE_POLL_S)
+            )
+        start(pin_number)
+
+    manager._start_edge_detection = start_with_short_polls
+
+
+def _release(radio: Any) -> None:  # MeshCore Companion
+    """Clean the radio up. A failure is logged, and does not end the service.
+
+    The GPIO manager of the library answers a pin that it cannot take with ``sys.exit``,
+    also from inside ``cleanup()``.
+    """
+    try:
+        radio.cleanup()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        log.warning("radio cleanup failed: %r", exc)
 
 
 def apply_preamble(radio: Any, symbols: int) -> None:

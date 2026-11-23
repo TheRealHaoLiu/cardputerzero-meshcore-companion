@@ -10,6 +10,18 @@ One process, run by systemd as the ``meshcore`` user:
 With "Run in background" off the node is not started, and the process exits once no tile
 has been connected for a while, so it costs no memory. systemd starts it again when the
 tile connects to the control socket (socket activation).
+
+With it on, the node runs only while the Cap LoRa-1262 is on the header, and the service
+keeps away from a different Cap:
+
+* It looks for the Cap once when it starts (at boot, or when the tile is opened): a tenth
+  of a second of power on the header and one I2C read. Without the Cap nothing is
+  started, nothing is retried, the radio library is not loaded, and the process exits
+  when no tile is connected, as with "Run in background" off. It never looks on a timer:
+  a look powers whatever Cap is attached.
+* While the node runs, one I2C read every :data:`CAP_POLL_S` tells that the Cap is still
+  there. When it comes off, the node stops (no radio task, no Bluetooth advertising, the
+  header power back off), and the service is as without a Cap.
 """
 
 import asyncio
@@ -28,12 +40,17 @@ from . import statefile
 
 log = logging.getLogger("meshcore-companion")
 
-IDLE_EXIT_S = 20  # background off: exit after this long without a tile connected
+IDLE_EXIT_S = 20  # background off, or no Cap: exit after this long without a tile connected
 PAIR_WINDOW_S = 120
 PAIR_WINDOW_MAX_S = 300  # the longest pairing window the control socket may ask for
 PAIR_GRACE_S = 30  # a pairing that started in the window may finish this much later
 RETRY_FIRST_S = 30  # background on: a failed node or Bluetooth start is retried after this,
 RETRY_MAX_S = 600  # doubling up to this, and back to the first delay once it works
+# Caps get swapped with the power on, and the next one uses the same pins for other things,
+# so the node lets go of them soon after the Cap comes off.
+CAP_POLL_S = 1  # while the node runs: how often the service reads whether the Cap is still on
+CAP_RECHECK_S = 0.2  # the node stops when the Cap also fails a second read this much later
+CAP_LOOK_AGAIN_S = 5  # a tile that connects sooner after a look that found no Cap gets no new one
 _ADAPTER = "/org/bluez/hci0"
 
 
@@ -49,6 +66,8 @@ class Service:
         self.node: Any = None
         self.ble: Any = None
         self.node_error: Optional[str] = None
+        self.cap: Optional[bool] = None  # False: the last look found no Cap, or it came off
+        self._looked = 0.0  # when that was
         self._failing = False  # the node start failed and is being retried
         self._ble_task: Optional[asyncio.Task] = None
         self.pair_until = 0.0
@@ -76,6 +95,7 @@ class Service:
         if self.running:
             return
         self.node_error = None
+        self.cap = None
         self._failing = False
         self.node_stop = asyncio.Event()
         self.node_task = asyncio.create_task(self._run_node(self.node_stop))
@@ -88,6 +108,7 @@ class Service:
             except asyncio.TimeoutError:
                 log.warning("node did not stop in time")
         self.server = self.node = self.ble = None
+        self.cap = None
 
     async def restart_node(self) -> None:
         await self.stop_node()
@@ -95,14 +116,16 @@ class Service:
             self.start_node()
 
     async def _run_node(self, stop: asyncio.Event) -> None:
-        """Run the node until ``stop``; with "Run in background" on, retry a failed start.
+        """Run the node until ``stop`` or until the Cap is gone; retry a failed start.
 
-        The radio may be held by another app, its device node may not be there yet at
-        boot, or the Bluetooth daemon may not be up: each is retried after
-        :data:`RETRY_FIRST_S`, doubling to :data:`RETRY_MAX_S`. The journal gets one line
-        when the node starts failing and one when it recovers, not one per attempt.
+        Without the Cap there is nothing to start and nothing to retry: a retry would
+        power whatever is on the header instead. With the Cap on, the radio may still be
+        held by another app, its device node may not be there yet at boot, or the
+        Bluetooth daemon may not be up: each is retried after :data:`RETRY_FIRST_S`,
+        doubling to :data:`RETRY_MAX_S`. The journal gets one line when the node starts
+        failing and one when it recovers, not one per attempt.
         """
-        from . import radionode  # heavy imports only when the radio runs
+        from . import radionode  # the radio library itself loads once the Cap has answered
 
         delay = RETRY_FIRST_S
         while not stop.is_set():
@@ -115,7 +138,7 @@ class Service:
                     "bind": "0.0.0.0" if self.settings["wifi"] else "127.0.0.1",
                     "port": cfg.TCP_PORT,
                 },
-                "frame_server_class": _frame_server_class(self),
+                "frame_server_factory": lambda: _frame_server_class(self),
             }
 
             def report(message: Dict[str, Any]) -> None:
@@ -123,35 +146,85 @@ class Service:
                     self.node_error = _friendly(message.get("kind"), message.get("message"))
                 self.broadcast({"event": "status", "status": self.status()})
 
+            halt = asyncio.Event()  # ends this run: told to stop, or the Cap came off
+            watch = asyncio.create_task(self._watch_cap(stop, halt))
             came_up = False
             QUIET.active = self._failing  # a retried start: keep its lines out of the journal
             try:
-                await radionode.run_node(conf, report, setup_server=self._setup_server, stop=stop)
-                return
+                await radionode.run_node(conf, report, setup_server=self._setup_server, stop=halt)
             except Exception as exc:  # noqa: BLE001 - reported to the tile, not fatal
                 came_up = self.server is not None
-                self.node_error = _friendly(getattr(exc, "kind", None), str(exc))
-                if not self._failing:
-                    retry = (f"; retrying in {delay} s, then less often"
-                             if self.settings["background"] else "")
-                    log.error("node failed: %s: %s%s", getattr(exc, "kind", "failed"), exc, retry)
-                    self._failing = True
+                if getattr(exc, "kind", None) == "absent":
+                    if not self._looked:  # one line, not one for each look from the tile
+                        log.info("no LoRa Cap attached: off until the tile is opened or the "
+                                 "next boot")
+                    self.cap = False
+                else:
+                    self.node_error = _friendly(getattr(exc, "kind", None), str(exc))
+                    if not self._failing:
+                        retry = (f"; retrying in {delay} s, then less often"
+                                 if self.settings["background"] else "")
+                        log.error("node failed: %s: %s%s", getattr(exc, "kind", "failed"), exc,
+                                  retry)
+                        self._failing = True
             finally:
+                watch.cancel()
                 QUIET.active = False
                 self.server = self.node = self.ble = None
+                if self.cap is False:
+                    self._looked = time.monotonic()
                 self.broadcast({"event": "status", "status": self.status()})
-            if not self.settings["background"]:
+            if stop.is_set() or self.cap is False or not self.settings["background"]:
                 return
             if came_up:
                 delay = RETRY_FIRST_S  # it ran, then failed: start over with a short wait
-            try:
-                await asyncio.wait_for(stop.wait(), delay)
-            except asyncio.TimeoutError:
-                pass
+            if await self._stopped(stop, delay):
+                return
             delay = min(delay * 2, RETRY_MAX_S)
+
+    @staticmethod
+    async def _stopped(stop: asyncio.Event, seconds: float) -> bool:
+        """Wait ``seconds``; True at once when ``stop`` is set."""
+        try:
+            await asyncio.wait_for(stop.wait(), seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _watch_cap(self, stop: asyncio.Event, halt: asyncio.Event) -> None:
+        """While the node runs: end the run when told to stop, or when the Cap comes off.
+
+        Nothing else notices a Cap that is gone: the radio library keeps talking to an
+        empty bus, and Bluetooth keeps advertising a radio that is not there. The read
+        switches nothing; before the node is up it only says what the start finds too.
+        """
+        from . import radionode
+
+        def attached() -> bool:
+            return self.server is None or radionode.cap_present(cfg.CAP_LORA_1262)
+
+        while not await self._stopped(stop, CAP_POLL_S):
+            if attached():
+                continue
+            if await self._stopped(stop, CAP_RECHECK_S):
+                break
+            if not attached():
+                log.info("LoRa Cap removed: stopping the node; off until the tile is opened "
+                         "or the next boot")
+                self.cap = False
+                break
+        halt.set()
+
+    def look_again(self, asked: bool = False) -> None:
+        """If the last look found no Cap, look once more: the tile was opened (not twice
+        in :data:`CAP_LOOK_AGAIN_S`), or the user ``asked`` for it there."""
+        if (self.settings["background"] and not self.running and self.cap is False
+                and (asked or time.monotonic() - self._looked > CAP_LOOK_AGAIN_S)):
+            self.start_node()
 
     async def _setup_server(self, server: Any, node: Any):
         self.server, self.node = server, node
+        self.cap = True
         QUIET.active = False
         if self._failing:
             log.info("node is up again")
@@ -372,7 +445,8 @@ class Service:
         contacts = node.contacts.get_count() if node is not None else None
         return {
             "running": self.running and server is not None,
-            "starting": self.running and server is None,
+            "starting": self.running and server is None and self.cap is not False,
+            "cap": self.cap,  # False: no Cap LoRa-1262 on the header, so the node is off
             "error": self.node_error,
             "settings": dict(self.settings),
             "node_name": name,
@@ -444,6 +518,10 @@ class Service:
             return {"ok": True, "status": self.status()}
         if cmd == "subscribe":
             self.subscribers.add(writer)
+            self.look_again()
+            return {"ok": True, "status": self.status()}
+        if cmd == "look":
+            self.look_again(asked=True)
             return {"ok": True, "status": self.status()}
         if cmd == "pair":
             seconds = req.get("seconds", PAIR_WINDOW_S)
@@ -479,9 +557,10 @@ class Service:
                 except asyncio.TimeoutError:
                     pass
                 idle = time.monotonic() - self._last_client
-                if (not self.settings["background"] and not self.running and not self.clients
-                        and idle > IDLE_EXIT_S):
-                    log.info("background off and no tile connected: exiting")
+                if ((not self.settings["background"] or self.cap is False)
+                        and not self.running and not self.clients and idle > IDLE_EXIT_S):
+                    log.info("%s and no tile connected: exiting",
+                             "no LoRa Cap" if self.settings["background"] else "background off")
                     break
         await self.stop_node()
         if self._bus is not None:
